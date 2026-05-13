@@ -1,0 +1,130 @@
+{
+  "name": "erp-dashboard-sync",
+  "displayName": "ERP Dashboard Sync",
+  "description": "Sync JS/CSS files between VS Code workspace and APplus ERP dashboard",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.118.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:erp-dashboard-sync.initializeWorkspace",
+    "onCommand:erp-dashboard-sync.refreshFromErp"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "erp-dashboard-sync.initializeWorkspace",
+        "title": "ERP Dashboard Sync: Initialize Workspace"
+      },
+      {
+        "command": "erp-dashboard-sync.refreshFromErp",
+        "title": "ERP Dashboard Sync: Reload From ERP"
+      }
+    ],
+    "configuration": {
+      "title": "ERP Dashboard Sync",
+      "properties": {
+        "erpDashboardSync.dbFetchJsonUrl": {
+          "type": "string",
+          "default": "https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/customutils.asmx/dbFetchJSON",
+          "description": "ERP endpoint for dbFetchJSON. SQL is appended as query parameter 'sql'."
+        },
+        "erpDashboardSync.xmlUpdateOfflineSoapUrl": {
+          "type": "string",
+          "default": "https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/utils.asmx",
+          "description": "ERP SOAP endpoint for xmlUpdateOffline (SOAP 1.2)."
+        },
+        "erpDashboardSync.xmlUpdateOfflineHttpUrl": {
+          "type": "string",
+          "default": "https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/utils.asmx/xmlUpdateOffline",
+          "description": "ERP HTTP endpoint for xmlUpdateOffline (application/x-www-form-urlencoded)."
+        },
+        "erpDashboardSync.updateTransport": {
+          "type": "string",
+          "enum": [
+            "soap12",
+            "httpPost"
+          ],
+          "default": "soap12",
+          "description": "Transport used for xmlUpdateOffline updates."
+        },
+        "erpDashboardSync.authMode": {
+          "type": "string",
+          "enum": [
+            "none",
+            "ntlm"
+          ],
+          "default": "ntlm",
+          "description": "Authentication mode used for ERP requests."
+        },
+        "erpDashboardSync.authUsername": {
+          "type": "string",
+          "default": "",
+          "description": "Username for NTLM authentication."
+        },
+        "erpDashboardSync.authPassword": {
+          "type": "string",
+          "default": "",
+          "description": "Password for NTLM authentication. Prefer VS Code Secret Storage in productive environments."
+        },
+        "erpDashboardSync.authDomain": {
+          "type": "string",
+          "default": "",
+          "description": "Domain for NTLM authentication (optional if username already includes domain)."
+        },
+        "erpDashboardSync.authWorkstation": {
+          "type": "string",
+          "default": "",
+          "description": "Workstation for NTLM authentication (optional)."
+        },
+        "erpDashboardSync.autoSyncOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically write managed JS/CSS changes back to ERP on file save."
+        },
+        "erpDashboardSync.configFileName": {
+          "type": "string",
+          "default": ".erp-dashboard-sync.json",
+          "description": "Workspace file storing dashboard name and local ERP sync metadata."
+        },
+        "erpDashboardSync.indexFileName": {
+          "type": "string",
+          "default": ".erp-dashboard-sync-index.json",
+          "description": "Workspace file mapping generated JS/CSS files to ERP rows and fields."
+        },
+        "erpDashboardSync.generatedRootDir": {
+          "type": "string",
+          "default": "erp-dashboard",
+          "description": "Folder where dashboard JS/CSS files are generated."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/mocha": "^10.0.10",
+    "@types/node": "22.x",
+    "@types/vscode": "^1.118.0",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2",
+    "eslint": "^9.39.3",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.56.1"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^5.8.0",
+    "httpntlm": "^1.8.13"
+  }
+}

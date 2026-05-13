@@ -1,0 +1,17 @@
+- Project type: VS Code extension (TypeScript)
+- Purpose: Sync APplus ERP dashboard/query JS and CSS files with local workspace files
+- Key commands:
+  - `ERP Dashboard Sync: Initialize Workspace`
+  - `ERP Dashboard Sync: Reload From ERP`
+- Key flow:
+  - Create/read `.erp-dashboard-sync.json` with dashboardId
+  - Load data via `dbFetchJSON?sql=...`
+  - Generate files below `erp-dashboard/<dashboardId>/...`
+  - Track mapping in `.erp-dashboard-sync-index.json`
+  - On save, update `QVQUERY` or `QVDASHBOARD` using `xmlUpdateOffline`
+- Authentication:
+  - Support `none` and `ntlm`
+  - NTLM uses configured username/password/domain/workstation
+- Build and validation:
+  - `npm run compile`
+  - `npm run lint`

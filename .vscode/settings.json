@@ -1,0 +1,26 @@
+// Place your settings in this file to overwrite default and user settings.
+{
+	// ERP Dashboard Sync defaults for your environment.
+	"erpDashboardSync.dbFetchJsonUrl": "https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/customutils.asmx/dbFetchJSON",
+	"erpDashboardSync.xmlUpdateOfflineSoapUrl": "https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/utils.asmx",
+	"erpDashboardSync.xmlUpdateOfflineHttpUrl": "https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/utils.asmx/xmlUpdateOffline",
+	"erpDashboardSync.updateTransport": "soap12",
+	"erpDashboardSync.authMode": "ntlm",
+	"erpDashboardSync.authUsername": "",
+	"erpDashboardSync.authPassword": "",
+	"erpDashboardSync.authDomain": "",
+	"erpDashboardSync.authWorkstation": "",
+	"erpDashboardSync.autoSyncOnSave": true,
+	"erpDashboardSync.configFileName": ".erp-dashboard-sync.json",
+	"erpDashboardSync.indexFileName": ".erp-dashboard-sync-index.json",
+	"erpDashboardSync.generatedRootDir": "erp-dashboard",
+
+	"files.exclude": {
+		"out": false // set this to true to hide the "out" folder with the compiled JS files
+	},
+	"search.exclude": {
+		"out": true // set this to false to include "out" folder in search results
+	},
+	// Turn off tsc task auto detection since we have the necessary tasks as npm scripts
+	"typescript.tsc.autoDetect": "off"
+}
