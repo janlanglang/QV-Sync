@@ -5,7 +5,6 @@ import { XMLParser } from 'fast-xml-parser';
 import * as httpntlm from 'httpntlm';
 
 type AuthMode = 'none' | 'ntlm';
-type UpdateTransport = 'soap12' | 'httpPost';
 type RecordType = 'QUERY' | 'DASHBOARD';
 
 interface LocalConfig {
@@ -17,8 +16,6 @@ interface RuntimeConfig {
 	localConfig: LocalConfig;
 	dbFetchJsonUrl: string;
 	xmlUpdateOfflineSoapUrl: string;
-	xmlUpdateOfflineHttpUrl: string;
-	updateTransport: UpdateTransport;
 	tlsAllowInsecure: boolean;
 	authMode: AuthMode;
 	authUsername: string;
@@ -68,6 +65,8 @@ interface RequestOptions {
 
 const OUTPUT_CHANNEL = vscode.window.createOutputChannel('ERP Dashboard Sync');
 const XML_PARSER = new XMLParser({ ignoreAttributes: false, trimValues: false });
+const DEPRECATED_SETTING_KEYS = ['xmlUpdateOfflineHttpUrl', 'updateTransport'] as const;
+let deprecatedSettingsMigrationCompleted = false;
 
 export function activate(context: vscode.ExtensionContext): void {
 	context.subscriptions.push(OUTPUT_CHANNEL);
@@ -173,6 +172,11 @@ async function loadRuntimeConfig(
 	promptForDashboard: boolean
 ): Promise<RuntimeConfig | undefined> {
 	const settings = vscode.workspace.getConfiguration('erpDashboardSync', workspaceFolder.uri);
+	if (!deprecatedSettingsMigrationCompleted) {
+		await migrateDeprecatedSettings(settings);
+		deprecatedSettingsMigrationCompleted = true;
+	}
+
 	const configFileName = settings.get<string>('configFileName', '.erp-dashboard-sync.json');
 	const localConfigUri = vscode.Uri.joinPath(workspaceFolder.uri, configFileName);
 	let localConfig = await readJsonFile<LocalConfig>(localConfigUri);
@@ -213,11 +217,6 @@ async function loadRuntimeConfig(
 			'xmlUpdateOfflineSoapUrl',
 			'https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/utils.asmx'
 		),
-		xmlUpdateOfflineHttpUrl: settings.get<string>(
-			'xmlUpdateOfflineHttpUrl',
-			'https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/utils.asmx/xmlUpdateOffline'
-		),
-		updateTransport: settings.get<UpdateTransport>('updateTransport', 'soap12'),
 		tlsAllowInsecure: settings.get<boolean>('tlsAllowInsecure', false),
 		authMode: settings.get<AuthMode>('authMode', 'ntlm'),
 		authUsername,
@@ -239,6 +238,53 @@ async function loadRuntimeConfig(
 	logAuthConfigurationDiagnostics(settings, runtimeConfig);
 
 	return runtimeConfig;
+}
+
+async function migrateDeprecatedSettings(settings: vscode.WorkspaceConfiguration): Promise<void> {
+	let removedCount = 0;
+
+	for (const key of DEPRECATED_SETTING_KEYS) {
+		const inspect = settings.inspect<unknown>(key);
+		if (!inspect) {
+			continue;
+		}
+
+		removedCount += await clearDeprecatedSettingInScope(settings, key, inspect.globalValue, vscode.ConfigurationTarget.Global);
+		removedCount += await clearDeprecatedSettingInScope(settings, key, inspect.workspaceValue, vscode.ConfigurationTarget.Workspace);
+		removedCount += await clearDeprecatedSettingInScope(
+			settings,
+			key,
+			inspect.workspaceFolderValue,
+			vscode.ConfigurationTarget.WorkspaceFolder
+		);
+	}
+
+	if (removedCount > 0) {
+		OUTPUT_CHANNEL.appendLine(
+			`[Config] Migration: ${removedCount} veraltete Setting-Werte entfernt (xmlUpdateOfflineHttpUrl/updateTransport).`
+		);
+	}
+}
+
+async function clearDeprecatedSettingInScope(
+	settings: vscode.WorkspaceConfiguration,
+	key: (typeof DEPRECATED_SETTING_KEYS)[number],
+	value: unknown,
+	target: vscode.ConfigurationTarget
+): Promise<number> {
+	if (value === undefined) {
+		return 0;
+	}
+
+	try {
+		await settings.update(key, undefined, target);
+		return 1;
+	} catch (error) {
+		OUTPUT_CHANNEL.appendLine(
+			`[Config] Migration-Warnung: Konnte '${key}' in Scope ${String(target)} nicht entfernen: ${formatError(error)}`
+		);
+		return 0;
+	}
 }
 
 function logAuthConfigurationDiagnostics(
@@ -474,36 +520,11 @@ async function pushUpdate(config: RuntimeConfig, entry: FileIndexEntry, content:
 	const updateData = toCData(updateDataRow);
 	const whereClause = `GUID='${escapeSqlString(entry.guid)}'`;
 	OUTPUT_CHANNEL.appendLine('[SaveSync] ---- BEGIN REQUEST ----');
-	OUTPUT_CHANNEL.appendLine(`[SaveSync] Transport: ${config.updateTransport}`);
+	OUTPUT_CHANNEL.appendLine('[SaveSync] Transport: soap12');
 	OUTPUT_CHANNEL.appendLine(`[SaveSync] Target: ${entry.table}.${entry.field}`);
 	OUTPUT_CHANNEL.appendLine(`[SaveSync] Record: ${entry.recordName} (${entry.type})`);
 	OUTPUT_CHANNEL.appendLine(`[SaveSync] GUID: ${entry.guid}`);
 	OUTPUT_CHANNEL.appendLine(`[SaveSync] Content length: ${content.length}`);
-
-	if (config.updateTransport === 'httpPost') {
-		const body = new URLSearchParams({
-			table: entry.table,
-			updateData,
-			sWhere: whereClause
-		}).toString();
-		OUTPUT_CHANNEL.appendLine(`[SaveSync] Method: POST`);
-		OUTPUT_CHANNEL.appendLine(`[SaveSync] Endpoint: ${config.xmlUpdateOfflineHttpUrl}`);
-		OUTPUT_CHANNEL.appendLine(`[SaveSync] Headers: Content-Type=application/x-www-form-urlencoded`);
-		OUTPUT_CHANNEL.appendLine('[SaveSync] Body (x-www-form-urlencoded):');
-		OUTPUT_CHANNEL.appendLine(body);
-
-		await requestText({
-			method: 'POST',
-			url: config.xmlUpdateOfflineHttpUrl,
-			headers: {
-				'Content-Type': 'application/x-www-form-urlencoded'
-			},
-			body,
-			config
-		});
-		OUTPUT_CHANNEL.appendLine('[SaveSync] ---- END REQUEST ----');
-		return;
-	}
 
 	const soapBody = buildSoapEnvelope(entry.table, updateData, whereClause);
 	OUTPUT_CHANNEL.appendLine(`[SaveSync] Method: POST`);

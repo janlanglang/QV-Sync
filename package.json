@@ -3,6 +3,7 @@
   "displayName": "ERP Dashboard Sync",
   "description": "Sync JS/CSS files between VS Code workspace and APplus ERP dashboard",
   "version": "0.1.0",
+  "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "vscode": "^1.118.0"
   },
@@ -42,20 +43,6 @@
           "type": "string",
           "default": "https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/utils.asmx",
           "description": "ERP SOAP endpoint for xmlUpdateOffline (SOAP 1.2)."
-        },
-        "erpDashboardSync.xmlUpdateOfflineHttpUrl": {
-          "type": "string",
-          "default": "https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/utils.asmx/xmlUpdateOffline",
-          "description": "ERP HTTP endpoint for xmlUpdateOffline (application/x-www-form-urlencoded)."
-        },
-        "erpDashboardSync.updateTransport": {
-          "type": "string",
-          "enum": [
-            "soap12",
-            "httpPost"
-          ],
-          "default": "soap12",
-          "description": "Transport used for xmlUpdateOffline updates."
         },
         "erpDashboardSync.tlsAllowInsecure": {
           "type": "boolean",
@@ -121,7 +108,7 @@
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
     "test": "vscode-test",
-    "package:vsix": "npx @vscode/vsce package --allow-missing-repository",
+    "package:vsix": "npx @vscode/vsce package --allow-missing-repository --skip-license",
     "release:vsix": "powershell -ExecutionPolicy Bypass -File ./scripts/release-vsix.ps1",
     "release:vsix:no-bump": "powershell -ExecutionPolicy Bypass -File ./scripts/release-vsix.ps1 -Bump none"
   },

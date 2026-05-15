@@ -28,8 +28,7 @@ VS Code extension to synchronize APplus dashboard/query JS and CSS sources with 
 
 - `erpDashboardSync.dbFetchJsonUrl`
 - `erpDashboardSync.xmlUpdateOfflineSoapUrl`
-- `erpDashboardSync.xmlUpdateOfflineHttpUrl`
-- `erpDashboardSync.updateTransport` (`soap12` or `httpPost`)
+- Update-Transport ist fest auf SOAP 1.2.
 - `erpDashboardSync.authMode` (`none` or `ntlm`)
 - `erpDashboardSync.authUsername`
 - `erpDashboardSync.authPassword`
@@ -65,3 +64,27 @@ The generated `.vsix` file can be installed on another machine with:
 
 - VS Code UI: Extensions view -> `...` -> `Install from VSIX...`
 - CLI: `code --install-extension <path-to-vsix>`
+
+## JSON Webservice Beispiel:
+
+```csharp
+[WebMethod]
+public string dbFetchJSON(string sql)
+{
+  xmlDB x;
+  string ret;
+
+
+  WebUtils.checkSQL(sql);
+  x = new xmlDB("Artikel", sql);
+  try
+  {
+    ret = x.GetRowsAsJson();
+  }
+  finally
+  {
+    x.Close();
+  }
+  return (ret);
+} // dbFetchJSON
+```
