@@ -1,10 +1,11 @@
 // Place your settings in this file to overwrite default and user settings.
 {
 	// ERP Dashboard Sync defaults for your environment.
-	"erpDashboardSync.dbFetchJsonUrl": "https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/customutils.asmx/dbFetchJSON",
-	"erpDashboardSync.xmlUpdateOfflineSoapUrl": "https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/utils.asmx",
-	"erpDashboardSync.xmlUpdateOfflineHttpUrl": "https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/utils.asmx/xmlUpdateOffline",
+	"erpDashboardSync.dbFetchJsonUrl": "http://systec-vs74/APplusdeploy/flexmobility/customutils.asmx/dbFetchJSON",
+	"erpDashboardSync.xmlUpdateOfflineSoapUrl": "http://systec-vs74/APplusdeploy/flexmobility/utils.asmx",
+	"erpDashboardSync.xmlUpdateOfflineHttpUrl": "http://systec-vs74/APplusdeploy/flexmobility/utils.asmx/xmlUpdateOffline",
 	"erpDashboardSync.updateTransport": "soap12",
+	"erpDashboardSync.tlsAllowInsecure": true,
 	"erpDashboardSync.authMode": "ntlm",
 	"erpDashboardSync.authUsername": "",
 	"erpDashboardSync.authPassword": "",

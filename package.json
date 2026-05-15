@@ -2,7 +2,7 @@
   "name": "erp-dashboard-sync",
   "displayName": "ERP Dashboard Sync",
   "description": "Sync JS/CSS files between VS Code workspace and APplus ERP dashboard",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "engines": {
     "vscode": "^1.118.0"
   },
@@ -52,6 +52,11 @@
           ],
           "default": "soap12",
           "description": "Transport used for xmlUpdateOffline updates."
+        },
+        "erpDashboardSync.tlsAllowInsecure": {
+          "type": "boolean",
+          "default": false,
+          "description": "Allow HTTPS connections with invalid/self-signed certificates. Use only in trusted internal environments."
         },
         "erpDashboardSync.authMode": {
           "type": "string",
@@ -111,12 +116,16 @@
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
-    "test": "vscode-test"
+    "test": "vscode-test",
+    "package:vsix": "npx @vscode/vsce package --allow-missing-repository",
+    "release:vsix": "powershell -ExecutionPolicy Bypass -File ./scripts/release-vsix.ps1",
+    "release:vsix:no-bump": "powershell -ExecutionPolicy Bypass -File ./scripts/release-vsix.ps1 -Bump none"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
     "@types/node": "22.x",
     "@types/vscode": "^1.118.0",
+    "@vscode/vsce": "^3.6.2",
     "@vscode/test-cli": "^0.0.12",
     "@vscode/test-electron": "^2.5.2",
     "eslint": "^9.39.3",
@@ -125,6 +134,7 @@
   },
   "dependencies": {
     "fast-xml-parser": "^5.8.0",
-    "httpntlm": "^1.8.13"
+    "httpntlm": "^1.8.13",
+    "jsonrepair": "^3.13.1"
   }
 }

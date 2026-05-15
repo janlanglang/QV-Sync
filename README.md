@@ -54,3 +54,14 @@ For environments where Postman requires NTLM, configure:
 - Compile: `npm run compile`
 - Watch: `npm run watch`
 - Lint: `npm run lint`
+
+## Build VSIX / Distribution
+
+- One-command release (version bump + compile + package): `npm run release:vsix`
+- Package only (no version bump): `npm run release:vsix:no-bump`
+- Raw package command: `npm run package:vsix`
+
+The generated `.vsix` file can be installed on another machine with:
+
+- VS Code UI: Extensions view -> `...` -> `Install from VSIX...`
+- CLI: `code --install-extension <path-to-vsix>`
