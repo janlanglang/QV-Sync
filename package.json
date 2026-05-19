@@ -2,7 +2,7 @@
   "name": "erp-dashboard-sync",
   "displayName": "ERP Dashboard Sync",
   "description": "Sync JS/CSS files between VS Code workspace and APplus ERP dashboard",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "vscode": "^1.118.0"

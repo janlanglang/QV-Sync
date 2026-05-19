@@ -534,22 +534,39 @@ async function deleteCredentialsFromSecretStorage(workspaceFolder: vscode.Worksp
 }
 
 async function fetchDashboardRows(config: RuntimeConfig): Promise<DbRow[]> {
-	const sql = buildDashboardSql(config.localConfig.dashboardId);
-	const fetchUrl = new URL(config.dbFetchJsonUrl);
-	fetchUrl.searchParams.set('sql', sql);
-	OUTPUT_CHANNEL.appendLine('[DBFetch] ---- BEGIN REQUEST ----');
-	OUTPUT_CHANNEL.appendLine(`[DBFetch] Dashboard: ${config.localConfig.dashboardId}`);
-	OUTPUT_CHANNEL.appendLine(`[DBFetch] Endpoint: ${config.dbFetchJsonUrl}`);
-	OUTPUT_CHANNEL.appendLine(`[DBFetch] Request URL (encoded): ${fetchUrl.toString()}`);
-	OUTPUT_CHANNEL.appendLine('[DBFetch] SQL (decoded):');
-	OUTPUT_CHANNEL.appendLine(sql);
-	OUTPUT_CHANNEL.appendLine('[DBFetch] ---- END REQUEST ----');
+	const executeFetch = async (includeAnpVersion: boolean): Promise<string> => {
+		const sql = buildDashboardSql(config.localConfig.dashboardId, includeAnpVersion);
+		const fetchUrl = new URL(config.dbFetchJsonUrl);
+		fetchUrl.searchParams.set('sql', sql);
+		OUTPUT_CHANNEL.appendLine('[DBFetch] ---- BEGIN REQUEST ----');
+		OUTPUT_CHANNEL.appendLine(`[DBFetch] Dashboard: ${config.localConfig.dashboardId}`);
+		OUTPUT_CHANNEL.appendLine(`[DBFetch] Endpoint: ${config.dbFetchJsonUrl}`);
+		OUTPUT_CHANNEL.appendLine(`[DBFetch] Mode: ${includeAnpVersion ? 'with ANP_VERSION' : 'without ANP_VERSION (fallback)'}`);
+		OUTPUT_CHANNEL.appendLine(`[DBFetch] Request URL (encoded): ${fetchUrl.toString()}`);
+		OUTPUT_CHANNEL.appendLine('[DBFetch] SQL (decoded):');
+		OUTPUT_CHANNEL.appendLine(sql);
+		OUTPUT_CHANNEL.appendLine('[DBFetch] ---- END REQUEST ----');
 
-	const responseText = await requestText({
-		method: 'GET',
-		url: fetchUrl.toString(),
-		config
-	});
+		return requestText({
+			method: 'GET',
+			url: fetchUrl.toString(),
+			config
+		});
+	};
+
+	let responseText: string;
+	try {
+		responseText = await executeFetch(true);
+	} catch (error) {
+		if (!shouldFallbackWithoutAnpVersion(error)) {
+			throw error;
+		}
+
+		OUTPUT_CHANNEL.appendLine(
+			`[DBFetch] Anfrage mit ANP_VERSION fehlgeschlagen, fallback ohne ANP_VERSION wird versucht: ${formatError(error)}`
+		);
+		responseText = await executeFetch(false);
+	}
 
 	if (!responseText || responseText.trim().length === 0) {
 		OUTPUT_CHANNEL.appendLine('[DBFetch] Leere Antwort erhalten (Body length = 0).');
@@ -573,6 +590,23 @@ async function fetchDashboardRows(config: RuntimeConfig): Promise<DbRow[]> {
 	return list
 		.map((item) => normalizeDbRow(item))
 		.filter((item): item is DbRow => item !== undefined);
+}
+
+function shouldFallbackWithoutAnpVersion(error: unknown): boolean {
+	const message = formatError(error).toLowerCase();
+	const mentionsAnpVersion = /anp[_\s-]?version/.test(message);
+	if (!mentionsAnpVersion) {
+		return false;
+	}
+
+	const isColumnError =
+		message.includes('invalid column') ||
+		message.includes('unknown column') ||
+		message.includes('ungueltiger spaltenname') ||
+		message.includes('ung\u00fcltiger spaltenname') ||
+		message.includes('spaltenname');
+
+	return isColumnError;
 }
 
 async function parseDbFetchJson(rawJson: string): Promise<unknown> {
@@ -1078,16 +1112,22 @@ function describeAuthIdentity(username: string, domain: string): string {
 	return `${usernameHint}, ${domainHint}`;
 }
 
-function buildDashboardSql(dashboardId: string): string {
+function buildDashboardSql(dashboardId: string, includeAnpVersion: boolean): string {
 	const sanitizedId = escapeSqlString(dashboardId);
-	return `select qvquery.qvquery,qvquery.title,qvquery.GUID,qvquery.STATEMENT, QVQUERY.JSPAGESCRIPT,QVQUERY.CSSSTYLE, QVQUERY.VERSION, type='QUERY' from QVQUERY
+	const anpQueryField = includeAnpVersion
+		? 'qvdashboard.anp_version as ANP_VERSION'
+		: "'' as ANP_VERSION";
+	const anpDashboardField = includeAnpVersion
+		? 'QVDASHBOARD.ANP_VERSION as ANP_VERSION'
+		: "'' as ANP_VERSION";
+	return `select qvquery.qvquery,qvquery.title,qvquery.GUID,qvquery.STATEMENT, QVQUERY.JSPAGESCRIPT,QVQUERY.CSSSTYLE, QVQUERY.VERSION, ${anpQueryField}, type='QUERY' from QVQUERY
 join QVDASHBOARDQUERY on QVQUERY.QVQUERY = QVDASHBOARDQUERY.QVQUERY
 join QVDASHBOARD on QVDASHBOARDQUERY.QVDASHBOARD = QVDASHBOARD.QVDASHBOARD
 where QVDASHBOARD.QVDASHBOARD = '${sanitizedId}'
 
 UNION ALL
 
-select QVDASHBOARD.QVDASHBOARD,QVDASHBOARD.title,QVDASHBOARD.GUID,'' as STATEMENT, QVDASHBOARD.JSPAGESCRIPT,QVDASHBOARD.CSSSTYLE, VERSION=QVDASHBOARD.INFO, type='DASHBOARD'
+select QVDASHBOARD.QVDASHBOARD,QVDASHBOARD.title,QVDASHBOARD.GUID,'' as STATEMENT, QVDASHBOARD.JSPAGESCRIPT,QVDASHBOARD.CSSSTYLE, VERSION=QVDASHBOARD.INFO, ${anpDashboardField}, type='DASHBOARD'
 from QVDASHBOARD
 where QVDASHBOARD.QVDASHBOARD = '${sanitizedId}'`;
 }

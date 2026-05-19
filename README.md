@@ -16,6 +16,8 @@ VS Code extension to synchronize APplus dashboard/query JS and CSS sources with 
 - `erp-dashboard/<dashboardId>/...`: generated JavaScript and CSS files.
 
 ## Commands
+- Extension updaten (VSIX installieren) und VS Code neu laden.
+- Command Palette öffnen: Strg+Shift+P.
 
 - `ERP Dashboard Sync: Initialize Workspace`
 	- Prompts for dashboard name.
@@ -34,10 +36,6 @@ VS Code extension to synchronize APplus dashboard/query JS and CSS sources with 
 - `erpDashboardSync.xmlUpdateOfflineSoapUrl`
 - Update-Transport ist fest auf SOAP 1.2.
 - `erpDashboardSync.authMode` (`none` or `ntlm`)
-- `erpDashboardSync.authUsername`
-- `erpDashboardSync.authPassword`
-- `erpDashboardSync.authDomain`
-- `erpDashboardSync.authWorkstation`
 - `erpDashboardSync.autoSyncOnSave`
 - `erpDashboardSync.configFileName`
 - `erpDashboardSync.indexFileName`
@@ -96,4 +94,33 @@ public string dbFetchJSON(string sql)
   }
   return (ret);
 } // dbFetchJSON
+```
+
+### DB Anpassung für Versionsfeld in QVDashboard:
+
+```
+<?xml version="1.0" encoding="UTF-8" ?>
+<dbchange xmlns="http://schemas.p2plus.com/P2plus40/dbChangeSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://schemas.p2plus.com/P2plus40/dbChangeSchema dbChangeSchema.xsd">
+  <createLogFile>dbchlog_20260518.txt</createLogFile>
+  <!--JLANGENBERG 18.05.2026-->
+  <addField>
+    <table>QVDASHBOARD</table>
+    <name>ANP_VERSION</name>
+    <type>int</type>
+    <description/>
+  </addField>
+  <closeLogFile/>
+</dbchange>
+
+```
+
+### Anpassung WebProject/WebServer/Quickviews/DashboardTransfer.aspx
+
+ab Zeile 286
+```csharp
+else if (table == "QVDASHBOARD" && cmd == "modify") {
+  versionLocal = Int32.Parse(WebUtils.getSimpleScalarValue(table, "ANP_VERSION", keyCol, key) ?? "0");
+  versionImport = (xRecord.SelectSingleNode("ANP_VERSION") == null ? 0 : Int32.Parse(xRecord.SelectSingleNode("ANP_VERSION").InnerText ?? "0"));
+  isNewVersion = versionLocal == 0 || versionImport > versionLocal;
+}
 ```
