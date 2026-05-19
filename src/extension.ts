@@ -22,10 +22,18 @@ interface RuntimeConfig {
 	authPassword: string;
 	authDomain: string;
 	authWorkstation: string;
+	authSource: 'settings' | 'secretStorage';
 	autoSyncOnSave: boolean;
 	configFileName: string;
 	indexFileName: string;
 	generatedRootDir: string;
+}
+
+interface StoredCredentials {
+	username: string;
+	password: string;
+	domain: string;
+	workstation: string;
 }
 
 interface DbRow {
@@ -66,9 +74,12 @@ interface RequestOptions {
 const OUTPUT_CHANNEL = vscode.window.createOutputChannel('ERP Dashboard Sync');
 const XML_PARSER = new XMLParser({ ignoreAttributes: false, trimValues: false });
 const DEPRECATED_SETTING_KEYS = ['xmlUpdateOfflineHttpUrl', 'updateTransport'] as const;
+const SECRET_STORAGE_PREFIX = 'erp-dashboard-sync';
 let deprecatedSettingsMigrationCompleted = false;
+let extensionContext: vscode.ExtensionContext | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
+	extensionContext = context;
 	context.subscriptions.push(OUTPUT_CHANNEL);
 
 	context.subscriptions.push(
@@ -80,6 +91,18 @@ export function activate(context: vscode.ExtensionContext): void {
 	context.subscriptions.push(
 		vscode.commands.registerCommand('erp-dashboard-sync.refreshFromErp', async () => {
 			await initializeWorkspace(false);
+		})
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand('erp-dashboard-sync.setCredentials', async () => {
+			await setCredentialsInSecretStorage();
+		})
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand('erp-dashboard-sync.clearCredentials', async () => {
+			await clearCredentialsInSecretStorage();
 		})
 	);
 
@@ -180,10 +203,11 @@ async function loadRuntimeConfig(
 	const configFileName = settings.get<string>('configFileName', '.erp-dashboard-sync.json');
 	const localConfigUri = vscode.Uri.joinPath(workspaceFolder.uri, configFileName);
 	let localConfig = await readJsonFile<LocalConfig>(localConfigUri);
-	const authUsernameRaw = settings.get<string>('authUsername', '');
-	const authPassword = settings.get<string>('authPassword', '');
-	const authDomainRaw = settings.get<string>('authDomain', '');
-	const authWorkstationRaw = settings.get<string>('authWorkstation', '');
+	const authSettings = await resolveAuthSettings(workspaceFolder, settings);
+	const authUsernameRaw = authSettings.username;
+	const authPassword = authSettings.password;
+	const authDomainRaw = authSettings.domain;
+	const authWorkstationRaw = authSettings.workstation;
 	const authUsername = authUsernameRaw.trim();
 	const authDomain = authDomainRaw.trim();
 	const authWorkstation = authWorkstationRaw.trim();
@@ -223,6 +247,7 @@ async function loadRuntimeConfig(
 		authPassword,
 		authDomain,
 		authWorkstation,
+		authSource: authSettings.source,
 		autoSyncOnSave: settings.get<boolean>('autoSyncOnSave', true),
 		configFileName,
 		indexFileName: settings.get<string>('indexFileName', '.erp-dashboard-sync-index.json'),
@@ -299,6 +324,7 @@ function logAuthConfigurationDiagnostics(
 	OUTPUT_CHANNEL.appendLine('[Config] ERP Dashboard Sync runtime configuration loaded.');
 	OUTPUT_CHANNEL.appendLine(`[Config] Workspace folder: ${config.workspaceFolder.uri.fsPath}`);
 	OUTPUT_CHANNEL.appendLine(`[Config] authMode=${config.authMode}`);
+	OUTPUT_CHANNEL.appendLine(`[Config] authSource=${config.authSource}`);
 	OUTPUT_CHANNEL.appendLine(`[Config] tlsAllowInsecure=${config.tlsAllowInsecure ? 'yes' : 'no'}`);
 	OUTPUT_CHANNEL.appendLine(
 		`[Config] authUsername set=${config.authUsername.trim().length > 0 ? 'yes' : 'no'} (length=${config.authUsername.length})`
@@ -330,6 +356,181 @@ function logAuthConfigurationDiagnostics(
 			"[Config] Warnung: Username enthaelt bereits 'domain\\user' UND authDomain ist gesetzt. Das fuehrt oft zu 401."
 		);
 	}
+}
+
+async function resolveAuthSettings(
+	workspaceFolder: vscode.WorkspaceFolder,
+	settings: vscode.WorkspaceConfiguration
+): Promise<StoredCredentials & { source: 'settings' | 'secretStorage' }> {
+	const stored = await readCredentialsFromSecretStorage(workspaceFolder);
+	if (stored) {
+		return {
+			...stored,
+			source: 'secretStorage'
+		};
+	}
+
+	return {
+		username: settings.get<string>('authUsername', ''),
+		password: settings.get<string>('authPassword', ''),
+		domain: settings.get<string>('authDomain', ''),
+		workstation: settings.get<string>('authWorkstation', ''),
+		source: 'settings'
+	};
+}
+
+async function setCredentialsInSecretStorage(): Promise<void> {
+	const workspaceFolder = getPrimaryWorkspaceFolder();
+	if (!workspaceFolder) {
+		vscode.window.showErrorMessage('ERP Dashboard Sync: Bitte zuerst einen Workspace-Ordner oeffnen.');
+		return;
+	}
+
+	if (!extensionContext) {
+		vscode.window.showErrorMessage('ERP Dashboard Sync: Secret Storage ist nicht verfuegbar.');
+		return;
+	}
+
+	const settings = vscode.workspace.getConfiguration('erpDashboardSync', workspaceFolder.uri);
+	const current = await resolveAuthSettings(workspaceFolder, settings);
+
+	const username = await vscode.window.showInputBox({
+		title: 'ERP Dashboard Sync Credentials',
+		prompt: 'NTLM Username',
+		value: current.username,
+		ignoreFocusOut: true,
+		validateInput: (value) => (value.trim().length === 0 ? 'Username ist erforderlich.' : undefined)
+	});
+
+	if (username === undefined) {
+		return;
+	}
+
+	const passwordInput = await vscode.window.showInputBox({
+		title: 'ERP Dashboard Sync Credentials',
+		prompt: 'NTLM Passwort (leer lassen = bestehendes beibehalten)',
+		password: true,
+		ignoreFocusOut: true,
+		validateInput: (value) => {
+			if (value.length > 0 || current.password.length > 0) {
+				return undefined;
+			}
+			return 'Passwort ist erforderlich.';
+		}
+	});
+
+	if (passwordInput === undefined) {
+		return;
+	}
+
+	const domain = await vscode.window.showInputBox({
+		title: 'ERP Dashboard Sync Credentials',
+		prompt: 'NTLM Domain (optional)',
+		value: current.domain,
+		ignoreFocusOut: true
+	});
+
+	if (domain === undefined) {
+		return;
+	}
+
+	const workstation = await vscode.window.showInputBox({
+		title: 'ERP Dashboard Sync Credentials',
+		prompt: 'NTLM Workstation (optional)',
+		value: current.workstation,
+		ignoreFocusOut: true
+	});
+
+	if (workstation === undefined) {
+		return;
+	}
+
+	await writeCredentialsToSecretStorage(workspaceFolder, {
+		username: username.trim(),
+		password: passwordInput.length > 0 ? passwordInput : current.password,
+		domain: domain.trim(),
+		workstation: workstation.trim()
+	});
+
+	vscode.window.showInformationMessage('ERP Dashboard Sync: Credentials sicher im Secret Storage gespeichert.');
+}
+
+async function clearCredentialsInSecretStorage(): Promise<void> {
+	const workspaceFolder = getPrimaryWorkspaceFolder();
+	if (!workspaceFolder) {
+		vscode.window.showErrorMessage('ERP Dashboard Sync: Bitte zuerst einen Workspace-Ordner oeffnen.');
+		return;
+	}
+
+	if (!extensionContext) {
+		vscode.window.showErrorMessage('ERP Dashboard Sync: Secret Storage ist nicht verfuegbar.');
+		return;
+	}
+
+	const answer = await vscode.window.showWarningMessage(
+		'ERP Dashboard Sync: Gespeicherte Credentials aus dem Secret Storage loeschen?',
+		{ modal: true },
+		'Loeschen'
+	);
+
+	if (answer !== 'Loeschen') {
+		return;
+	}
+
+	await deleteCredentialsFromSecretStorage(workspaceFolder);
+	vscode.window.showInformationMessage('ERP Dashboard Sync: Credentials aus Secret Storage geloescht.');
+}
+
+function getSecretStorageKey(workspaceFolder: vscode.WorkspaceFolder): string {
+	return `${SECRET_STORAGE_PREFIX}:credentials:${workspaceFolder.uri.toString()}`;
+}
+
+async function readCredentialsFromSecretStorage(
+	workspaceFolder: vscode.WorkspaceFolder
+): Promise<StoredCredentials | undefined> {
+	if (!extensionContext) {
+		return undefined;
+	}
+
+	const key = getSecretStorageKey(workspaceFolder);
+	const raw = await extensionContext.secrets.get(key);
+	if (!raw) {
+		return undefined;
+	}
+
+	try {
+		const parsed = JSON.parse(raw) as Partial<StoredCredentials>;
+		return {
+			username: typeof parsed.username === 'string' ? parsed.username : '',
+			password: typeof parsed.password === 'string' ? parsed.password : '',
+			domain: typeof parsed.domain === 'string' ? parsed.domain : '',
+			workstation: typeof parsed.workstation === 'string' ? parsed.workstation : ''
+		};
+	} catch (error) {
+		OUTPUT_CHANNEL.appendLine(`[Config] Ungueltiger Secret-Storage Inhalt, verwende Settings-Fallback: ${formatError(error)}`);
+		return undefined;
+	}
+}
+
+async function writeCredentialsToSecretStorage(
+	workspaceFolder: vscode.WorkspaceFolder,
+	credentials: StoredCredentials
+): Promise<void> {
+	if (!extensionContext) {
+		throw new Error('Secret Storage ist nicht verfuegbar.');
+	}
+
+	const key = getSecretStorageKey(workspaceFolder);
+	await extensionContext.secrets.store(key, JSON.stringify(credentials));
+}
+
+async function deleteCredentialsFromSecretStorage(workspaceFolder: vscode.WorkspaceFolder): Promise<void> {
+	if (!extensionContext) {
+		return;
+	}
+
+	const key = getSecretStorageKey(workspaceFolder);
+	await extensionContext.secrets.delete(key);
 }
 
 async function fetchDashboardRows(config: RuntimeConfig): Promise<DbRow[]> {

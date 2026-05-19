@@ -2,7 +2,7 @@
   "name": "erp-dashboard-sync",
   "displayName": "ERP Dashboard Sync",
   "description": "Sync JS/CSS files between VS Code workspace and APplus ERP dashboard",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "vscode": "^1.118.0"
@@ -29,6 +29,14 @@
       {
         "command": "erp-dashboard-sync.refreshFromErp",
         "title": "ERP Dashboard Sync: Reload From ERP"
+      },
+      {
+        "command": "erp-dashboard-sync.setCredentials",
+        "title": "ERP Dashboard Sync: Set Credentials (Secret Storage)"
+      },
+      {
+        "command": "erp-dashboard-sync.clearCredentials",
+        "title": "ERP Dashboard Sync: Clear Credentials (Secret Storage)"
       }
     ],
     "configuration": {
@@ -61,22 +69,22 @@
         "erpDashboardSync.authUsername": {
           "type": "string",
           "default": "",
-          "description": "Username for NTLM authentication."
+          "description": "Username for NTLM authentication (fallback, if no Secret Storage credentials exist)."
         },
         "erpDashboardSync.authPassword": {
           "type": "string",
           "default": "",
-          "description": "Password for NTLM authentication. Prefer VS Code Secret Storage in productive environments."
+          "description": "Password fallback for NTLM authentication. Prefer command 'Set Credentials (Secret Storage)' instead of plaintext settings."
         },
         "erpDashboardSync.authDomain": {
           "type": "string",
           "default": "",
-          "description": "Domain for NTLM authentication (optional if username already includes domain)."
+          "description": "Domain for NTLM authentication (fallback, if no Secret Storage credentials exist)."
         },
         "erpDashboardSync.authWorkstation": {
           "type": "string",
           "default": "",
-          "description": "Workstation for NTLM authentication (optional)."
+          "description": "Workstation for NTLM authentication (fallback, if no Secret Storage credentials exist)."
         },
         "erpDashboardSync.autoSyncOnSave": {
           "type": "boolean",

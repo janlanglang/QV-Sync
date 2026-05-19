@@ -23,6 +23,10 @@ VS Code extension to synchronize APplus dashboard/query JS and CSS sources with 
 	- Downloads and generates files.
 - `ERP Dashboard Sync: Reload From ERP`
 	- Uses existing config and reloads all generated files.
+- `ERP Dashboard Sync: Set Credentials (Secret Storage)`
+  - Stores NTLM username/password/domain/workstation securely in VS Code Secret Storage.
+- `ERP Dashboard Sync: Clear Credentials (Secret Storage)`
+  - Removes stored credentials from VS Code Secret Storage.
 
 ## Extension Settings
 
@@ -44,9 +48,14 @@ VS Code extension to synchronize APplus dashboard/query JS and CSS sources with 
 For environments where Postman requires NTLM, configure:
 
 - `erpDashboardSync.authMode = ntlm`
-- `erpDashboardSync.authUsername`
-- `erpDashboardSync.authPassword`
+- Preferred: run `ERP Dashboard Sync: Set Credentials (Secret Storage)`
+- Fallback: `erpDashboardSync.authUsername` / `erpDashboardSync.authPassword`
 - optional domain/workstation fields
+
+Credential precedence:
+
+1. Secret Storage credentials (recommended)
+2. Plain settings (`authUsername` / `authPassword` / `authDomain` / `authWorkstation`) as fallback
 
 ## Development
 
