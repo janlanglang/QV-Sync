@@ -51,6 +51,7 @@ interface FileIndexEntry {
 	relativePath: string;
 	table: 'QVQUERY' | 'QVDASHBOARD';
 	field: 'JSPAGESCRIPT' | 'CSSSTYLE' | 'STATEMENT';
+	versionField?: 'VERSION' | 'ANP_VERSION';
 	guid: string;
 	recordName: string;
 	type: RecordType;
@@ -111,6 +112,8 @@ export function activate(context: vscode.ExtensionContext): void {
 			await syncDocumentOnSave(document);
 		})
 	);
+
+	void triggerStartupReloadIfConfigured();
 }
 
 export function deactivate(): void {
@@ -153,6 +156,42 @@ async function initializeWorkspace(promptForDashboard: boolean): Promise<void> {
 	);
 }
 
+async function triggerStartupReloadIfConfigured(): Promise<void> {
+	const workspaceFolder = getPrimaryWorkspaceFolder();
+	if (!workspaceFolder) {
+		return;
+	}
+
+	const settings = vscode.workspace.getConfiguration('erpDashboardSync', workspaceFolder.uri);
+	if (!settings.get<boolean>('reloadOnStartup', true)) {
+		return;
+	}
+
+	const configFileName = settings.get<string>('configFileName', '.erp-dashboard-sync.json');
+	const localConfigUri = vscode.Uri.joinPath(workspaceFolder.uri, configFileName);
+	const localConfig = await readJsonFile<LocalConfig>(localConfigUri);
+	if (!localConfig?.dashboardId?.trim()) {
+		return;
+	}
+
+	const dashboardId = localConfig.dashboardId.trim();
+	const shouldPrompt = settings.get<boolean>('reloadOnStartupPrompt', true);
+	if (shouldPrompt) {
+		const answer = await vscode.window.showInformationMessage(
+			`ERP Dashboard Sync: Dashboard '${dashboardId}' ist verknuepft. Aktuellen Stand aus ERP laden?`,
+			'Laden',
+			'Nicht jetzt'
+		);
+
+		if (answer !== 'Laden') {
+			return;
+		}
+	}
+
+		OUTPUT_CHANNEL.appendLine(`[StartupReload] Starte Reload fuer Dashboard '${dashboardId}'.`);
+		await initializeWorkspace(false);
+}
+
 async function syncDocumentOnSave(document: vscode.TextDocument): Promise<void> {
 	if (document.languageId !== 'javascript' && document.languageId !== 'css' && document.languageId !== 'sql') {
 		return;
@@ -178,6 +217,8 @@ async function syncDocumentOnSave(document: vscode.TextDocument): Promise<void> 
 	if (!entry) {
 		return;
 	}
+
+	entry.versionField ??= getVersionFieldForRecordType(entry.type);
 
 	try {
 		await pushUpdate(config, entry, document.getText());
@@ -701,6 +742,7 @@ async function materializeFiles(config: RuntimeConfig, rows: DbRow[]): Promise<F
 			relativePath: jsRelativePath,
 			table: row.type === 'QUERY' ? 'QVQUERY' : 'QVDASHBOARD',
 			field: 'JSPAGESCRIPT',
+			versionField: row.type === 'QUERY' ? 'VERSION' : 'ANP_VERSION',
 			guid: row.guid,
 			recordName: row.title.trim().length > 0 ? `${row.name} - ${row.title}` : row.name,
 			type: row.type,
@@ -711,6 +753,7 @@ async function materializeFiles(config: RuntimeConfig, rows: DbRow[]): Promise<F
 			relativePath: cssRelativePath,
 			table: row.type === 'QUERY' ? 'QVQUERY' : 'QVDASHBOARD',
 			field: 'CSSSTYLE',
+			versionField: row.type === 'QUERY' ? 'VERSION' : 'ANP_VERSION',
 			guid: row.guid,
 			recordName: row.title.trim().length > 0 ? `${row.name} - ${row.title}` : row.name,
 			type: row.type,
@@ -725,6 +768,7 @@ async function materializeFiles(config: RuntimeConfig, rows: DbRow[]): Promise<F
 				relativePath: sqlRelativePath,
 				table: 'QVQUERY',
 				field: 'STATEMENT',
+				versionField: 'VERSION',
 				guid: row.guid,
 				recordName: row.title.trim().length > 0 ? `${row.name} - ${row.title}` : row.name,
 				type: row.type,
@@ -751,12 +795,18 @@ async function readIndex(config: RuntimeConfig): Promise<FileIndex | undefined> 
 }
 
 async function pushUpdate(config: RuntimeConfig, entry: FileIndexEntry, content: string): Promise<void> {
-	const updateDataRow = buildUpdateDataRow(entry.field, content);
+	const versionValue = formatVersionStamp(new Date());
+	const versionField = entry.versionField ?? getVersionFieldForRecordType(entry.type);
+	const updateDataRow = buildUpdateDataRow([
+		{ field: entry.field, value: content },
+		{ field: versionField, value: versionValue }
+	]);
 	const updateData = toCData(updateDataRow);
 	const whereClause = `GUID='${escapeSqlString(entry.guid)}'`;
 	OUTPUT_CHANNEL.appendLine('[SaveSync] ---- BEGIN REQUEST ----');
 	OUTPUT_CHANNEL.appendLine('[SaveSync] Transport: soap12');
 	OUTPUT_CHANNEL.appendLine(`[SaveSync] Target: ${entry.table}.${entry.field}`);
+	OUTPUT_CHANNEL.appendLine(`[SaveSync] Version target: ${entry.table}.${versionField}=${versionValue}`);
 	OUTPUT_CHANNEL.appendLine(`[SaveSync] Record: ${entry.recordName} (${entry.type})`);
 	OUTPUT_CHANNEL.appendLine(`[SaveSync] GUID: ${entry.guid}`);
 	OUTPUT_CHANNEL.appendLine(`[SaveSync] Content length: ${content.length}`);
@@ -779,8 +829,22 @@ async function pushUpdate(config: RuntimeConfig, entry: FileIndexEntry, content:
 	OUTPUT_CHANNEL.appendLine('[SaveSync] ---- END REQUEST ----');
 }
 
-function buildUpdateDataRow(field: FileIndexEntry['field'], value: string): string {
-	return `<row><${field}>${escapeXml(value)}</${field}></row>`;
+function buildUpdateDataRow(fields: Array<{ field: FileIndexEntry['field'] | FileIndexEntry['versionField']; value: string }>): string {
+	const rowContent = fields
+		.map(({ field, value }) => `<${field}>${escapeXml(value)}</${field}>`)
+		.join('');
+	return `<row>${rowContent}</row>`;
+}
+
+function formatVersionStamp(value: Date): string {
+	const year = value.getFullYear();
+	const month = String(value.getMonth() + 1).padStart(2, '0');
+	const day = String(value.getDate()).padStart(2, '0');
+	return `${year}${month}${day}`;
+}
+
+function getVersionFieldForRecordType(type: RecordType): FileIndexEntry['versionField'] {
+	return type === 'QUERY' ? 'VERSION' : 'ANP_VERSION';
 }
 
 function toCData(value: string): string {
@@ -1115,11 +1179,14 @@ function describeAuthIdentity(username: string, domain: string): string {
 function buildDashboardSql(dashboardId: string, includeAnpVersion: boolean): string {
 	const sanitizedId = escapeSqlString(dashboardId);
 	const anpQueryField = includeAnpVersion
-		? 'qvdashboard.anp_version as ANP_VERSION'
+		? "COALESCE(CAST(qvdashboard.anp_version as varchar(50)), '') as ANP_VERSION"
 		: "'' as ANP_VERSION";
 	const anpDashboardField = includeAnpVersion
-		? 'QVDASHBOARD.ANP_VERSION as ANP_VERSION'
+		? "COALESCE(CAST(QVDASHBOARD.ANP_VERSION as varchar(50)), '') as ANP_VERSION"
 		: "'' as ANP_VERSION";
+	const dashboardVersionField = includeAnpVersion
+		? "COALESCE(CAST(QVDASHBOARD.ANP_VERSION as varchar(50)), COALESCE(QVDASHBOARD.INFO, ''))"
+		: 'QVDASHBOARD.INFO';
 	return `select qvquery.qvquery,qvquery.title,qvquery.GUID,qvquery.STATEMENT, QVQUERY.JSPAGESCRIPT,QVQUERY.CSSSTYLE, QVQUERY.VERSION, ${anpQueryField}, type='QUERY' from QVQUERY
 join QVDASHBOARDQUERY on QVQUERY.QVQUERY = QVDASHBOARDQUERY.QVQUERY
 join QVDASHBOARD on QVDASHBOARDQUERY.QVDASHBOARD = QVDASHBOARD.QVDASHBOARD
@@ -1127,7 +1194,7 @@ where QVDASHBOARD.QVDASHBOARD = '${sanitizedId}'
 
 UNION ALL
 
-select QVDASHBOARD.QVDASHBOARD,QVDASHBOARD.title,QVDASHBOARD.GUID,'' as STATEMENT, QVDASHBOARD.JSPAGESCRIPT,QVDASHBOARD.CSSSTYLE, VERSION=QVDASHBOARD.INFO, ${anpDashboardField}, type='DASHBOARD'
+select QVDASHBOARD.QVDASHBOARD,QVDASHBOARD.title,QVDASHBOARD.GUID,'' as STATEMENT, QVDASHBOARD.JSPAGESCRIPT,QVDASHBOARD.CSSSTYLE, VERSION=${dashboardVersionField}, ${anpDashboardField}, type='DASHBOARD'
 from QVDASHBOARD
 where QVDASHBOARD.QVDASHBOARD = '${sanitizedId}'`;
 }
@@ -1170,7 +1237,7 @@ function normalizeDbRow(raw: unknown): DbRow | undefined {
 		statement: String(pick(obj, ['statement', 'STATEMENT']) ?? ''),
 		jsPageScript: String(pick(obj, ['jspagescript', 'JSPAGESCRIPT']) ?? ''),
 		cssStyle: String(pick(obj, ['cssstyle', 'CSSSTYLE']) ?? ''),
-		version: String(pick(obj, ['version', 'VERSION']) ?? ''),
+		version: String(pick(obj, ['version', 'VERSION', 'anp_version', 'ANP_VERSION']) ?? ''),
 		type: typeValue
 	};
 }

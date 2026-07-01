@@ -5,9 +5,13 @@ VS Code extension to synchronize APplus dashboard/query JS and CSS sources with 
 ## What It Does
 
 - Initializes the workspace for one dashboard (for example `wss_001`).
-- Executes `dbFetchJSON` with the SQL query and creates local `.js` and `.css` files.
+- Executes `dbFetchJSON` with the SQL query and creates local `.js`, `.css` and (for queries) `.sql` files.
 - Writes a local index file that maps each generated file to `QVQUERY` or `QVDASHBOARD` rows.
-- On save, updates `JSPAGESCRIPT` or `CSSSTYLE` via `xmlUpdateOffline`.
+- On save, updates `JSPAGESCRIPT`, `CSSSTYLE` or `STATEMENT` via `xmlUpdateOffline`.
+- On save, also updates the version field in format `YYYYMMDD`:
+  - `QVQUERY.VERSION` for query files
+  - `QVDASHBOARD.ANP_VERSION` for dashboard files
+- Optional startup reload: if a dashboard is already linked, the extension can ask once and then reload the latest ERP state.
 
 ## Generated Workspace Files
 
@@ -25,6 +29,7 @@ VS Code extension to synchronize APplus dashboard/query JS and CSS sources with 
 	- Downloads and generates files.
 - `ERP Dashboard Sync: Reload From ERP`
 	- Uses existing config and reloads all generated files.
+  - Useful as manual refresh when changes were made directly in ERP.
 - `ERP Dashboard Sync: Set Credentials (Secret Storage)`
   - Stores NTLM username/password/domain/workstation securely in VS Code Secret Storage.
 - `ERP Dashboard Sync: Clear Credentials (Secret Storage)`
@@ -37,9 +42,25 @@ VS Code extension to synchronize APplus dashboard/query JS and CSS sources with 
 - Update-Transport ist fest auf SOAP 1.2.
 - `erpDashboardSync.authMode` (`none` or `ntlm`)
 - `erpDashboardSync.autoSyncOnSave`
+- `erpDashboardSync.reloadOnStartup`
+- `erpDashboardSync.reloadOnStartupPrompt`
 - `erpDashboardSync.configFileName`
 - `erpDashboardSync.indexFileName`
 - `erpDashboardSync.generatedRootDir`
+
+## Version Fields (ANP_VERSION / VERSION)
+
+- Query rows use `QVQUERY.VERSION`.
+- Dashboard rows use `QVDASHBOARD.ANP_VERSION`.
+- During reload, the SQL first tries to include `ANP_VERSION`.
+- Fallback behavior: if ERP does not support `ANP_VERSION` yet (e.g. missing column), request parsing/SQL errors with ANP_VERSION trigger one automatic retry without ANP_VERSION.
+- During save, the content field and the matching version field are updated together in one `xmlUpdateOffline` call.
+
+## Startup Auto Reload
+
+- `erpDashboardSync.reloadOnStartup = true` (default): when a linked dashboard exists in `.erp-dashboard-sync.json`, startup reload is enabled.
+- `erpDashboardSync.reloadOnStartupPrompt = true` (default): show a short prompt (`Laden` / `Nicht jetzt`) before startup reload.
+- Set `reloadOnStartupPrompt = false` for fully automatic reload on startup.
 
 ## Authentication
 

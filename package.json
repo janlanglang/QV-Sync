@@ -2,7 +2,7 @@
   "name": "erp-dashboard-sync",
   "displayName": "ERP Dashboard Sync",
   "description": "Sync JS/CSS files between VS Code workspace and APplus ERP dashboard",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "vscode": "^1.118.0"
@@ -90,6 +90,16 @@
           "type": "boolean",
           "default": true,
           "description": "Automatically write managed JS/CSS changes back to ERP on file save."
+        },
+        "erpDashboardSync.reloadOnStartup": {
+          "type": "boolean",
+          "default": true,
+          "description": "If a dashboard is already linked in the workspace, offer or perform a reload from ERP when VS Code starts."
+        },
+        "erpDashboardSync.reloadOnStartupPrompt": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a short confirmation before the startup reload. If disabled, the reload runs automatically."
         },
         "erpDashboardSync.configFileName": {
           "type": "string",

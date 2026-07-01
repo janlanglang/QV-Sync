@@ -15,6 +15,9 @@ scripts/**
 package-lock.json
 *.vsix
 output.txt
+coverage/**
+*.tsbuildinfo
+LICENSE.md
 node_modules/**/test/**
 node_modules/**/tests/**
 node_modules/**/doc/**
