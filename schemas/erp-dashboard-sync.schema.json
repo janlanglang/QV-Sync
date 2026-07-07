@@ -20,6 +20,20 @@
       "type": "string",
       "description": "Optional human-readable label. For Flow, this is typically the TITLE fetched from the database."
     },
+    "quickviewVersionState": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "lastPromptDate": {
+          "type": "string",
+          "description": "Date when the Quickview custom version prompt was last shown, formatted as YYYY-MM-DD."
+        },
+        "pendingVersion": {
+          "type": "string",
+          "description": "Quickview version value selected for saves on the same day when non-date version logic is used."
+        }
+      }
+    },
     "flowVersionState": {
       "type": "object",
       "additionalProperties": false,

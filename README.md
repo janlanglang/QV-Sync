@@ -1,39 +1,71 @@
 # ERP Dashboard Sync
 
-VS Code extension to synchronize APplus dashboard/query JS and CSS sources with local files.
+VS Code extension to synchronize APplus Quickview and Flowboard sources with local files.
 
 ## What It Does
 
-- Initializes the workspace for one dashboard (for example `wss_001`).
-- Executes `dbFetchJSON` with the SQL query and creates local `.js`, `.css` and (for queries) `.sql` files.
-- Writes a local index file that maps each generated file to `QVQUERY` or `QVDASHBOARD` rows.
-- On save, updates `JSPAGESCRIPT`, `CSSSTYLE` or `STATEMENT` via `xmlUpdateOffline`.
-- On save, also updates the version field in format `YYYYMMDD`:
-  - `QVQUERY.VERSION` for query files
-  - `QVDASHBOARD.ANP_VERSION` for dashboard files
-- Optional startup reload: if a dashboard is already linked, the extension can ask once and then reload the latest ERP state.
+- Initializes one workspace for one context type:
+  - Quickview by dashboard name (for example `wss_001`)
+  - Flow by GUID
+- Loads data via `dbFetchJSON` and generates local files:
+  - Quickview: `.js`, `.css`, and for query rows `.sql`
+  - Flow: `.xml`, `.js`, `.sql`
+- Writes a local index file mapping each generated file to ERP table/field/GUID.
+- On save, writes changed content back via SOAP `xmlUpdateOffline`.
+- Handles version updates with context-specific logic (Quickview and Flow).
+- Optional startup reload: if a workspace is already linked, the extension can ask once and reload latest ERP state.
 
 ## Generated Workspace Files
 
-- `.erp-dashboard-sync.json`: dashboard configuration (initially stores `dashboardId`).
+- `.erp-dashboard-sync.json`: workspace configuration (`contextType`, identifier and version prompt state).
 - `.erp-dashboard-sync-index.json`: mapping of local files to ERP table/field/GUID.
-- `erp-dashboard/<dashboardId>/...`: generated JavaScript and CSS files.
+- `erp-dashboard/quickview/<dashboardId>/...`: generated Quickview files.
+- `erp-dashboard/flow/<flowGuid>/...`: generated Flow files.
+
+## Voraussetzungen
+
+- Zugriff auf APplus-Endpunkte:
+  - `dbFetchJSON`
+  - SOAP endpoint fuer `xmlUpdateOffline`
+- Korrekte Authentifizierung (typisch `ntlm`) inklusive Credentials.
+- In VS Code muss ein Ordner als Workspace geoeffnet sein.
+
+## Neuer Workspace und erster Abruf
+
+1. In VS Code einen neuen Ordner fuer die Bearbeitung anlegen und oeffnen.
+2. Extension installieren/aktualisieren und VS Code neu laden.
+3. Optional zuerst Credentials setzen:
+   - Command Palette: `ERP Dashboard Sync: Set Credentials (Secret Storage)`
+4. Erstinitialisierung starten:
+   - Command Palette: `ERP Dashboard Sync: Initialize Workspace`
+5. Im Dialog den Typ waehlen:
+   - `Quickview`
+   - `Flow`
+6. Identifier eingeben:
+   - Quickview: `QVDASHBOARD` Name
+   - Flow: `GUID`
+7. Extension legt Konfigurationsdateien an und laedt die Dateien aus ERP.
+
+Hinweis:
+- Fuer einen spaeteren manuellen Komplettabgleich: `ERP Dashboard Sync: Reload From ERP`.
 
 ## Commands
 - Extension updaten (VSIX installieren) und VS Code neu laden.
-- Command Palette öffnen: Strg+Shift+P.
+- Command Palette oeffnen: Strg+Shift+P.
 
 - `ERP Dashboard Sync: Initialize Workspace`
-	- Prompts for dashboard name.
-	- Saves local config.
-	- Downloads and generates files.
+	- Fragt zuerst den Typ (`Quickview` oder `Flow`), dann den Identifier.
+	- Speichert lokale Konfiguration.
+	- Laedt ERP-Daten und erzeugt Arbeitsdateien.
 - `ERP Dashboard Sync: Reload From ERP`
-	- Uses existing config and reloads all generated files.
-  - Useful as manual refresh when changes were made directly in ERP.
+	- Verwendet bestehende Konfiguration und laedt alle generierten Dateien neu.
+	- Sinnvoll als manueller Refresh bei Aenderungen direkt in ERP.
 - `ERP Dashboard Sync: Set Credentials (Secret Storage)`
-  - Stores NTLM username/password/domain/workstation securely in VS Code Secret Storage.
+  - Speichert NTLM username/password/domain/workstation sicher im VS Code Secret Storage.
 - `ERP Dashboard Sync: Clear Credentials (Secret Storage)`
-  - Removes stored credentials from VS Code Secret Storage.
+  - Entfernt gespeicherte Credentials aus VS Code Secret Storage.
+- `ERP Dashboard Sync: Reset Version Prompt State`
+  - Loescht gespeicherte Tagesentscheidungen fuer die Versionierungsabfragen (Quickview/Flow).
 
 ## Extension Settings
 
@@ -48,13 +80,45 @@ VS Code extension to synchronize APplus dashboard/query JS and CSS sources with 
 - `erpDashboardSync.indexFileName`
 - `erpDashboardSync.generatedRootDir`
 
-## Version Fields (ANP_VERSION / VERSION)
+## Versionierungslogik
 
-- Query rows use `QVQUERY.VERSION`.
-- Dashboard rows use `QVDASHBOARD.ANP_VERSION`.
-- During reload, the SQL first tries to include `ANP_VERSION`.
-- Fallback behavior: if ERP does not support `ANP_VERSION` yet (e.g. missing column), request parsing/SQL errors with ANP_VERSION trigger one automatic retry without ANP_VERSION.
-- During save, the content field and the matching version field are updated together in one `xmlUpdateOffline` call.
+### Quickview
+
+- Gespeicherte Version wird aus `QVQUERY.VERSION` bzw. `QVDASHBOARD.ANP_VERSION` gelesen.
+- Bei Save wird der Inhalt plus Versionsfeld zusammen in einem SOAP-Update geschrieben.
+- Wenn der aktuelle Versionswert ein gueltiges `YYYYMMDD` ist:
+  - Es wird ohne Rueckfrage automatisch auf das heutige Datum gesetzt.
+- Wenn der aktuelle Versionswert kein `YYYYMMDD` ist:
+  - Es wird maximal einmal pro Tag nach einem neuen Versionsstand gefragt.
+  - Im Prompt wird der aktuelle Wert als Referenz angezeigt.
+  - Weitere Saves am selben Tag verwenden den bereits eingegebenen Wert.
+
+### Flow
+
+- Flow-Inhalte werden in `FLOWBOARD` gespeichert:
+  - `XMLDEFINITION`
+  - `JAVASCRIPT`
+  - `SQLSTATEMENT`
+- Version wird als drei Felder behandelt:
+  - `MAJORVERSION`
+  - `MINORVERSION`
+  - `PATCHVERSION`
+- Wenn die aktuelle Flow-Version dem Datumsprinzip entspricht (`YYYY.MM.DD`):
+  - Automatisches Update auf aktuelles Datum (`YYYY`, `MM`, `DD`) ohne Rueckfrage.
+- Wenn die Version nicht dem Datumsprinzip entspricht:
+  - Maximal einmal pro Tag Auswahl, welcher Teil erhoeht wird (`major`, `minor`, `fix`).
+  - Danach automatische Wiederverwendung am selben Tag.
+  - Der bestehende Versionsstand wird als Referenz im Prompt angezeigt.
+
+### Tagesstatus zuruecksetzen
+
+- Falls am selben Tag eine neue Entscheidung erzwungen werden soll:
+  - Command `ERP Dashboard Sync: Reset Version Prompt State` ausfuehren.
+
+## ANP_VERSION Fallback beim Laden
+
+- Beim Quickview-Reload wird zunaechst SQL mit `ANP_VERSION` verwendet.
+- Falls `ANP_VERSION` serverseitig noch nicht verfuegbar ist, erfolgt ein automatischer Retry ohne `ANP_VERSION`.
 
 ## Startup Auto Reload
 

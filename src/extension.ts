@@ -13,7 +13,13 @@ interface LocalConfig {
 	contextType: DashboardContextType;
 	dashboardId: string;
 	displayName?: string;
+	quickviewVersionState?: QuickviewVersionState;
 	flowVersionState?: FlowVersionState;
+}
+
+interface QuickviewVersionState {
+	lastPromptDate?: string;
+	pendingVersion?: string;
 }
 
 interface FlowVersionState {
@@ -120,6 +126,12 @@ export function activate(context: vscode.ExtensionContext): void {
 	context.subscriptions.push(
 		vscode.commands.registerCommand('erp-dashboard-sync.clearCredentials', async () => {
 			await clearCredentialsInSecretStorage();
+		})
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand('erp-dashboard-sync.resetVersionPromptState', async () => {
+			await resetVersionPromptState();
 		})
 	);
 
@@ -245,7 +257,11 @@ async function syncDocumentOnSave(document: vscode.TextDocument): Promise<void> 
 	}
 
 	try {
-		await pushUpdate(config, entry, document.getText());
+		const pushed = await pushUpdate(config, entry, document.getText());
+		if (!pushed) {
+			vscode.window.setStatusBarMessage('ERP Sync: Update abgebrochen', 2500);
+			return;
+		}
 		vscode.window.setStatusBarMessage(`ERP Sync: ${entry.recordName} (${entry.field}) aktualisiert`, 2500);
 	} catch (error) {
 		OUTPUT_CHANNEL.appendLine(`Save-Sync fehlgeschlagen fuer ${relativePath}: ${formatError(error)}`);
@@ -364,6 +380,7 @@ async function promptForWorkspaceConfig(existingConfig: LocalConfig | undefined)
 		contextType: contextType.value,
 		dashboardId: identifierValue.trim(),
 		displayName: existingTitle,
+		quickviewVersionState: existingConfig?.quickviewVersionState,
 		flowVersionState: existingConfig?.flowVersionState
 	};
 }
@@ -407,6 +424,12 @@ function normalizeLocalConfig(localConfig: LocalConfig | undefined): LocalConfig
 		contextType: localConfig.contextType ?? 'quickview',
 		dashboardId: localConfig.dashboardId?.trim() ?? '',
 		displayName: localConfig.displayName?.trim() ? localConfig.displayName.trim() : undefined,
+		quickviewVersionState: localConfig.quickviewVersionState
+			? {
+				lastPromptDate: localConfig.quickviewVersionState.lastPromptDate?.trim() || undefined,
+				pendingVersion: localConfig.quickviewVersionState.pendingVersion?.trim() || undefined
+			}
+			: undefined,
 		flowVersionState: localConfig.flowVersionState
 			? {
 				lastPromptDate: localConfig.flowVersionState.lastPromptDate?.trim() || undefined,
@@ -630,6 +653,44 @@ async function clearCredentialsInSecretStorage(): Promise<void> {
 
 	await deleteCredentialsFromSecretStorage(workspaceFolder);
 	vscode.window.showInformationMessage('ERP Dashboard Sync: Credentials aus Secret Storage geloescht.');
+}
+
+async function resetVersionPromptState(): Promise<void> {
+	const workspaceFolder = getPrimaryWorkspaceFolder();
+	if (!workspaceFolder) {
+		vscode.window.showErrorMessage('ERP Dashboard Sync: Bitte zuerst einen Workspace-Ordner oeffnen.');
+		return;
+	}
+
+	const settings = vscode.workspace.getConfiguration('erpDashboardSync', workspaceFolder.uri);
+	const configFileName = settings.get<string>('configFileName', '.erp-dashboard-sync.json');
+	const localConfigUri = vscode.Uri.joinPath(workspaceFolder.uri, configFileName);
+	const localConfig = normalizeLocalConfig(await readJsonFile<LocalConfig>(localConfigUri));
+	if (!localConfig) {
+		vscode.window.showWarningMessage('ERP Dashboard Sync: Keine lokale Konfiguration gefunden.');
+		return;
+	}
+
+	const hasQuickviewState = Boolean(localConfig.quickviewVersionState?.lastPromptDate || localConfig.quickviewVersionState?.pendingVersion);
+	const hasFlowState = Boolean(localConfig.flowVersionState?.lastPromptDate || localConfig.flowVersionState?.pendingBump);
+	if (!hasQuickviewState && !hasFlowState) {
+		vscode.window.showInformationMessage('ERP Dashboard Sync: Es sind keine gespeicherten Versions-Prompt-States vorhanden.');
+		return;
+	}
+
+	const answer = await vscode.window.showWarningMessage(
+		'ERP Dashboard Sync: Gespeicherte Tagesentscheidung fuer Versionierung zuruecksetzen?',
+		{ modal: true },
+		'Zuruecksetzen'
+	);
+	if (answer !== 'Zuruecksetzen') {
+		return;
+	}
+
+	delete localConfig.quickviewVersionState;
+	delete localConfig.flowVersionState;
+	await writeJsonFile(localConfigUri, localConfig);
+	vscode.window.showInformationMessage('ERP Dashboard Sync: Versions-Prompt-States wurden zurueckgesetzt.');
 }
 
 function getSecretStorageKey(workspaceFolder: vscode.WorkspaceFolder): string {
@@ -997,13 +1058,34 @@ async function readIndex(config: RuntimeConfig): Promise<FileIndex | undefined> 
 	return readJsonFile<FileIndex>(indexUri);
 }
 
-async function pushUpdate(config: RuntimeConfig, entry: FileIndexEntry, content: string): Promise<void> {
+async function pushUpdate(config: RuntimeConfig, entry: FileIndexEntry, content: string): Promise<boolean> {
 	const versionField = entry.contextType === 'quickview' ? entry.versionField ?? getVersionFieldForRecordType(entry.type) : entry.versionField;
-	const updateFields: Array<{ field: FileIndexEntry['field'] | FileIndexEntry['versionField']; value: string }> = [
+	let versionValue: string | undefined;
+	let flowVersionUpdate: { major: string; minor: string; patch: string } | undefined;
+	if (entry.contextType === 'quickview' && versionField) {
+		versionValue = await resolveQuickviewVersionValue(config, entry);
+		if (versionValue === undefined) {
+			return false;
+		}
+	}
+
+	if (entry.contextType === 'flow') {
+		flowVersionUpdate = await resolveFlowVersionUpdate(config, entry);
+		if (!flowVersionUpdate) {
+			return false;
+		}
+	}
+
+	const updateFields: Array<{ field: string; value: string }> = [
 		{ field: entry.field, value: content }
 	];
-	if (versionField) {
-		updateFields.push({ field: versionField, value: formatVersionStamp(new Date()) });
+	if (versionField && versionValue !== undefined) {
+		updateFields.push({ field: versionField, value: versionValue });
+	}
+	if (flowVersionUpdate) {
+		updateFields.push({ field: 'MAJORVERSION', value: flowVersionUpdate.major });
+		updateFields.push({ field: 'MINORVERSION', value: flowVersionUpdate.minor });
+		updateFields.push({ field: 'PATCHVERSION', value: flowVersionUpdate.patch });
 	}
 	const updateDataRow = buildUpdateDataRow(updateFields);
 	const updateData = toCData(updateDataRow);
@@ -1011,8 +1093,13 @@ async function pushUpdate(config: RuntimeConfig, entry: FileIndexEntry, content:
 	OUTPUT_CHANNEL.appendLine('[SaveSync] ---- BEGIN REQUEST ----');
 	OUTPUT_CHANNEL.appendLine('[SaveSync] Transport: soap12');
 	OUTPUT_CHANNEL.appendLine(`[SaveSync] Target: ${entry.table}.${entry.field}`);
-	if (versionField) {
-		OUTPUT_CHANNEL.appendLine(`[SaveSync] Version target: ${entry.table}.${versionField}=${formatVersionStamp(new Date())}`);
+	if (versionField && versionValue !== undefined) {
+		OUTPUT_CHANNEL.appendLine(`[SaveSync] Version target: ${entry.table}.${versionField}=${versionValue}`);
+	}
+	if (flowVersionUpdate) {
+		OUTPUT_CHANNEL.appendLine(
+			`[SaveSync] Version target: ${entry.table}.MAJORVERSION=${flowVersionUpdate.major}, ${entry.table}.MINORVERSION=${flowVersionUpdate.minor}, ${entry.table}.PATCHVERSION=${flowVersionUpdate.patch}`
+		);
 	}
 	OUTPUT_CHANNEL.appendLine(`[SaveSync] Record: ${entry.recordName} (${entry.type})`);
 	OUTPUT_CHANNEL.appendLine(`[SaveSync] GUID: ${entry.guid}`);
@@ -1034,9 +1121,17 @@ async function pushUpdate(config: RuntimeConfig, entry: FileIndexEntry, content:
 		config
 	});
 	OUTPUT_CHANNEL.appendLine('[SaveSync] ---- END REQUEST ----');
+	if (versionValue !== undefined) {
+		entry.version = versionValue;
+	}
+	if (flowVersionUpdate) {
+		entry.version = `${flowVersionUpdate.major}.${flowVersionUpdate.minor}.${flowVersionUpdate.patch}`;
+	}
+
+	return true;
 }
 
-function buildUpdateDataRow(fields: Array<{ field: FileIndexEntry['field'] | FileIndexEntry['versionField']; value: string }>): string {
+function buildUpdateDataRow(fields: Array<{ field: string; value: string }>): string {
 	const rowContent = fields
 		.map(({ field, value }) => `<${field}>${escapeXml(value)}</${field}>`)
 		.join('');
@@ -1048,6 +1143,212 @@ function formatVersionStamp(value: Date): string {
 	const month = String(value.getMonth() + 1).padStart(2, '0');
 	const day = String(value.getDate()).padStart(2, '0');
 	return `${year}${month}${day}`;
+}
+
+async function resolveQuickviewVersionValue(config: RuntimeConfig, entry: FileIndexEntry): Promise<string | undefined> {
+	const currentVersion = entry.version.trim();
+	if (isDateVersionFormat(currentVersion)) {
+		return formatVersionStamp(new Date());
+	}
+
+	const todayKey = getTodayKey();
+	const quickviewState = config.localConfig.quickviewVersionState;
+	if (quickviewState?.lastPromptDate === todayKey && quickviewState.pendingVersion?.trim()) {
+		return quickviewState.pendingVersion.trim();
+	}
+
+	const manualVersion = await vscode.window.showInputBox({
+		title: 'ERP Dashboard Sync',
+		prompt: `Quickview '${entry.recordName}': Welcher neue Versionsstand soll gespeichert werden? Aktueller Stand: '${currentVersion || '<leer>'}'.`,
+		value: currentVersion || formatVersionStamp(new Date()),
+		ignoreFocusOut: true,
+		validateInput: (value) => (value.trim().length === 0 ? 'Versionsstand darf nicht leer sein.' : undefined)
+	});
+
+	if (manualVersion === undefined) {
+		return undefined;
+	}
+
+	config.localConfig.quickviewVersionState = {
+		lastPromptDate: todayKey,
+		pendingVersion: manualVersion.trim()
+	};
+	await writeJsonFile(config.localConfigUri, config.localConfig);
+
+	return manualVersion.trim();
+}
+
+async function resolveFlowVersionUpdate(
+	config: RuntimeConfig,
+	entry: FileIndexEntry
+): Promise<{ major: string; minor: string; patch: string } | undefined> {
+	const currentParts = parseFlowVersion(entry.version);
+	if (!currentParts) {
+		const manualParts = await promptFlowVersionParts(entry);
+		if (!manualParts) {
+			return undefined;
+		}
+
+		return manualParts;
+	}
+
+	if (isFlowDateVersion(currentParts)) {
+		const now = new Date();
+		return {
+			major: String(now.getFullYear()),
+			minor: String(now.getMonth() + 1).padStart(2, '0'),
+			patch: String(now.getDate()).padStart(2, '0')
+		};
+	}
+
+	const todayKey = getTodayKey();
+	let bump = config.localConfig.flowVersionState?.lastPromptDate === todayKey
+		? config.localConfig.flowVersionState.pendingBump
+		: undefined;
+
+	if (!bump) {
+		const decision = await vscode.window.showQuickPick(
+			[
+				{ label: 'Major +1', value: 'majorversion' as const },
+				{ label: 'Minor +1', value: 'minorversion' as const },
+				{ label: 'Fix +1', value: 'patchversion' as const }
+			],
+			{
+				title: 'ERP Flow Sync',
+				placeHolder: `Flow '${entry.recordName}': Aktuelle Version '${entry.version || '<leer>'}'. Welcher Teil soll um 1 erhoeht werden?`,
+				ignoreFocusOut: true
+			}
+		);
+
+		if (!decision) {
+			return undefined;
+		}
+
+		bump = decision.value;
+		config.localConfig.flowVersionState = {
+			lastPromptDate: todayKey,
+			pendingBump: bump
+		};
+		await writeJsonFile(config.localConfigUri, config.localConfig);
+	}
+
+	return bumpFlowVersion(currentParts, bump);
+}
+
+async function promptFlowVersionParts(
+	entry: FileIndexEntry
+): Promise<{ major: string; minor: string; patch: string } | undefined> {
+	const manualVersion = await vscode.window.showInputBox({
+		title: 'ERP Flow Sync',
+		prompt: `Flow '${entry.recordName}': Neuer Versionsstand als 'MAJOR.MINOR.PATCH'. Aktueller Stand: '${entry.version || '<leer>'}'.`,
+		value: entry.version || '1.0.0',
+		ignoreFocusOut: true,
+		validateInput: (value) => (parseFlowVersion(value.trim()) ? undefined : "Bitte im Format 'MAJOR.MINOR.PATCH' eingeben.")
+	});
+
+	if (manualVersion === undefined) {
+		return undefined;
+	}
+
+	return parseFlowVersion(manualVersion.trim());
+}
+
+function bumpFlowVersion(
+	parts: { major: string; minor: string; patch: string },
+	bump: FlowVersionBump
+): { major: string; minor: string; patch: string } {
+	const major = Number.parseInt(parts.major, 10);
+	const minor = Number.parseInt(parts.minor, 10);
+	const patch = Number.parseInt(parts.patch, 10);
+
+	if (!Number.isFinite(major) || !Number.isFinite(minor) || !Number.isFinite(patch)) {
+		return parts;
+	}
+
+	if (bump === 'majorversion') {
+		return {
+			major: String(major + 1),
+			minor: String(0),
+			patch: String(0)
+		};
+	}
+
+	if (bump === 'minorversion') {
+		return {
+			major: String(major),
+			minor: String(minor + 1),
+			patch: String(0)
+		};
+	}
+
+	return {
+		major: String(major),
+		minor: String(minor),
+		patch: String(patch + 1)
+	};
+}
+
+function parseFlowVersion(value: string): { major: string; minor: string; patch: string } | undefined {
+	const normalized = value.trim();
+	if (!normalized) {
+		return undefined;
+	}
+
+	const segments = normalized.split('.');
+	if (segments.length !== 3) {
+		return undefined;
+	}
+
+	const [major, minor, patch] = segments.map((segment) => segment.trim());
+	if (!major || !minor || !patch) {
+		return undefined;
+	}
+
+	return { major, minor, patch };
+}
+
+function isFlowDateVersion(parts: { major: string; minor: string; patch: string }): boolean {
+	if (!/^\d{4}$/.test(parts.major) || !/^\d{1,2}$/.test(parts.minor) || !/^\d{1,2}$/.test(parts.patch)) {
+		return false;
+	}
+
+	const year = Number(parts.major);
+	const month = Number(parts.minor);
+	const day = Number(parts.patch);
+	const parsed = new Date(Date.UTC(year, month - 1, day));
+	return (
+		parsed.getUTCFullYear() === year &&
+		parsed.getUTCMonth() === month - 1 &&
+		parsed.getUTCDate() === day
+	);
+}
+
+function getTodayKey(): string {
+	const now = new Date();
+	const year = now.getFullYear();
+	const month = String(now.getMonth() + 1).padStart(2, '0');
+	const day = String(now.getDate()).padStart(2, '0');
+	return `${year}-${month}-${day}`;
+}
+
+function isDateVersionFormat(value: string): boolean {
+	if (!/^\d{8}$/.test(value)) {
+		return false;
+	}
+
+	const year = Number(value.slice(0, 4));
+	const month = Number(value.slice(4, 6));
+	const day = Number(value.slice(6, 8));
+	if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) {
+		return false;
+	}
+
+	const parsed = new Date(Date.UTC(year, month - 1, day));
+	return (
+		parsed.getUTCFullYear() === year &&
+		parsed.getUTCMonth() === month - 1 &&
+		parsed.getUTCDate() === day
+	);
 }
 
 function getVersionFieldForRecordType(type: RecordType): FileIndexEntry['versionField'] {

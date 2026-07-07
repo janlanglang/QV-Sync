@@ -17,7 +17,8 @@
   "activationEvents": [
     "onStartupFinished",
     "onCommand:erp-dashboard-sync.initializeWorkspace",
-    "onCommand:erp-dashboard-sync.refreshFromErp"
+    "onCommand:erp-dashboard-sync.refreshFromErp",
+    "onCommand:erp-dashboard-sync.resetVersionPromptState"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -37,6 +38,10 @@
       {
         "command": "erp-dashboard-sync.clearCredentials",
         "title": "ERP Dashboard Sync: Clear Credentials (Secret Storage)"
+      },
+      {
+        "command": "erp-dashboard-sync.resetVersionPromptState",
+        "title": "ERP Dashboard Sync: Reset Version Prompt State"
       }
     ],
     "jsonValidation": [
