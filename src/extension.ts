@@ -6,13 +6,24 @@ import * as httpntlm from 'httpntlm';
 
 type AuthMode = 'none' | 'ntlm';
 type RecordType = 'QUERY' | 'DASHBOARD';
+type DashboardContextType = 'quickview' | 'flow';
+type FlowVersionBump = 'majorversion' | 'minorversion' | 'patchversion';
 
 interface LocalConfig {
+	contextType: DashboardContextType;
 	dashboardId: string;
+	displayName?: string;
+	flowVersionState?: FlowVersionState;
+}
+
+interface FlowVersionState {
+	lastPromptDate?: string;
+	pendingBump?: FlowVersionBump;
 }
 
 interface RuntimeConfig {
 	workspaceFolder: vscode.WorkspaceFolder;
+	localConfigUri: vscode.Uri;
 	localConfig: LocalConfig;
 	dbFetchJsonUrl: string;
 	xmlUpdateOfflineSoapUrl: string;
@@ -40,6 +51,9 @@ interface DbRow {
 	name: string;
 	title: string;
 	guid: string;
+	xmlDefinition?: string;
+	javascript?: string;
+	sqlStatement?: string;
 	statement: string;
 	jsPageScript: string;
 	cssStyle: string;
@@ -49,17 +63,19 @@ interface DbRow {
 
 interface FileIndexEntry {
 	relativePath: string;
-	table: 'QVQUERY' | 'QVDASHBOARD';
-	field: 'JSPAGESCRIPT' | 'CSSSTYLE' | 'STATEMENT';
+	table: 'QVQUERY' | 'QVDASHBOARD' | 'FLOWBOARD';
+	field: 'JSPAGESCRIPT' | 'CSSSTYLE' | 'STATEMENT' | 'XMLDEFINITION' | 'JAVASCRIPT' | 'SQLSTATEMENT';
 	versionField?: 'VERSION' | 'ANP_VERSION';
 	guid: string;
 	recordName: string;
 	type: RecordType;
 	version: string;
+	contextType: DashboardContextType;
 }
 
 interface FileIndex {
 	generatedAt: string;
+	contextType: DashboardContextType;
 	dashboardId: string;
 	entries: FileIndexEntry[];
 }
@@ -141,16 +157,19 @@ async function initializeWorkspace(promptForDashboard: boolean): Promise<void> {
 			}
 
 			progress.report({ message: 'Daten via dbFetchJSON abrufen...' });
-			const rows = await fetchDashboardRows(config);
+			const rows = await fetchWorkspaceRows(config);
+			if (config.localConfig.contextType === 'flow') {
+				await persistFlowDisplayName(config, rows[0]?.title);
+			}
 
-			progress.report({ message: 'JS/CSS Dateien erzeugen...' });
+			progress.report({ message: 'Arbeitsdateien erzeugen...' });
 			const index = await materializeFiles(config, rows);
 
 			progress.report({ message: 'Index schreiben...' });
 			await writeIndex(config, index);
 
 			vscode.window.showInformationMessage(
-				`ERP Dashboard Sync: ${rows.length} Elemente fuer Dashboard '${config.localConfig.dashboardId}' geladen.`
+				`ERP Dashboard Sync: ${rows.length} Elemente fuer ${getContextLabel(config.localConfig.contextType)} '${getWorkspaceLabel(config.localConfig)}' geladen.`
 			);
 		}
 	);
@@ -169,16 +188,16 @@ async function triggerStartupReloadIfConfigured(): Promise<void> {
 
 	const configFileName = settings.get<string>('configFileName', '.erp-dashboard-sync.json');
 	const localConfigUri = vscode.Uri.joinPath(workspaceFolder.uri, configFileName);
-	const localConfig = await readJsonFile<LocalConfig>(localConfigUri);
+	const localConfig = normalizeLocalConfig(await readJsonFile<LocalConfig>(localConfigUri));
 	if (!localConfig?.dashboardId?.trim()) {
 		return;
 	}
 
-	const dashboardId = localConfig.dashboardId.trim();
+	const workspaceLabel = getWorkspaceLabel(localConfig);
 	const shouldPrompt = settings.get<boolean>('reloadOnStartupPrompt', true);
 	if (shouldPrompt) {
 		const answer = await vscode.window.showInformationMessage(
-			`ERP Dashboard Sync: Dashboard '${dashboardId}' ist verknuepft. Aktuellen Stand aus ERP laden?`,
+			`ERP Dashboard Sync: ${getContextLabel(localConfig.contextType)} '${workspaceLabel}' ist verknuepft. Aktuellen Stand aus ERP laden?`,
 			'Laden',
 			'Nicht jetzt'
 		);
@@ -188,15 +207,11 @@ async function triggerStartupReloadIfConfigured(): Promise<void> {
 		}
 	}
 
-		OUTPUT_CHANNEL.appendLine(`[StartupReload] Starte Reload fuer Dashboard '${dashboardId}'.`);
-		await initializeWorkspace(false);
+	OUTPUT_CHANNEL.appendLine(`[StartupReload] Starte Reload fuer ${getContextLabel(localConfig.contextType)} '${workspaceLabel}'.`);
+	await initializeWorkspace(false);
 }
 
 async function syncDocumentOnSave(document: vscode.TextDocument): Promise<void> {
-	if (document.languageId !== 'javascript' && document.languageId !== 'css' && document.languageId !== 'sql') {
-		return;
-	}
-
 	const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
 	if (!workspaceFolder) {
 		return;
@@ -212,13 +227,22 @@ async function syncDocumentOnSave(document: vscode.TextDocument): Promise<void> 
 		return;
 	}
 
+	const managedLanguages = config.localConfig.contextType === 'flow' ? ['xml', 'javascript', 'sql'] : ['javascript', 'css', 'sql'];
+	if (!managedLanguages.includes(document.languageId)) {
+		return;
+	}
+
 	const relativePath = toPosixPath(path.relative(workspaceFolder.uri.fsPath, document.uri.fsPath));
 	const entry = index.entries.find((item) => item.relativePath === relativePath);
 	if (!entry) {
 		return;
 	}
 
-	entry.versionField ??= getVersionFieldForRecordType(entry.type);
+	entry.contextType ??= config.localConfig.contextType;
+
+	if (entry.contextType === 'quickview') {
+		entry.versionField ??= getVersionFieldForRecordType(entry.type);
+	}
 
 	try {
 		await pushUpdate(config, entry, document.getText());
@@ -254,25 +278,17 @@ async function loadRuntimeConfig(
 	const authWorkstation = authWorkstationRaw.trim();
 
 	if (!localConfig || !localConfig.dashboardId || promptForDashboard) {
-		const defaultDashboard = localConfig?.dashboardId ?? 'wss_001';
-		const dashboardId = await vscode.window.showInputBox({
-			title: 'ERP Dashboard Sync',
-			prompt: 'QVDASHBOARD Name (z. B. wss_001)',
-			value: defaultDashboard,
-			ignoreFocusOut: true,
-			validateInput: (value) => (value.trim().length === 0 ? 'Dashboard-Name ist erforderlich.' : undefined)
-		});
-
-		if (!dashboardId) {
+		localConfig = await promptForWorkspaceConfig(localConfig);
+		if (!localConfig) {
 			return undefined;
 		}
 
-		localConfig = { dashboardId: dashboardId.trim() };
 		await writeJsonFile(localConfigUri, localConfig);
 	}
 
 	const runtimeConfig: RuntimeConfig = {
 		workspaceFolder,
+		localConfigUri,
 		localConfig,
 		dbFetchJsonUrl: settings.get<string>(
 			'dbFetchJsonUrl',
@@ -304,6 +320,100 @@ async function loadRuntimeConfig(
 	logAuthConfigurationDiagnostics(settings, runtimeConfig);
 
 	return runtimeConfig;
+}
+
+async function promptForWorkspaceConfig(existingConfig: LocalConfig | undefined): Promise<LocalConfig | undefined> {
+	const contextType = await vscode.window.showQuickPick(
+		[
+			{ label: 'Quickview', value: 'quickview' as const, description: 'Eindeutiger Dashboard-Name' },
+			{ label: 'Flow', value: 'flow' as const, description: 'GUID als technische Identitaet' }
+		],
+		{
+			title: 'ERP Dashboard Sync',
+			placeHolder: 'Welcher Typ soll synchronisiert werden?'
+		}
+	);
+
+	if (!contextType) {
+		return undefined;
+	}
+
+	const existingId = existingConfig?.contextType === contextType.value ? existingConfig.dashboardId : undefined;
+	const existingTitle = existingConfig?.contextType === 'flow' ? existingConfig.displayName : undefined;
+	const defaultId = existingId ?? (contextType.value === 'quickview' ? 'wss_001' : '');
+	const identifierPrompt = contextType.value === 'quickview' ? 'QVDASHBOARD Name (z. B. wss_001)' : 'Flow GUID';
+	const identifierTitle = contextType.value === 'quickview' ? 'ERP Dashboard Sync' : 'ERP Flow Sync';
+	const identifierValue = await vscode.window.showInputBox({
+		title: identifierTitle,
+		prompt: identifierPrompt,
+		value: defaultId,
+		ignoreFocusOut: true,
+		validateInput: (value) =>
+			value.trim().length === 0
+				? contextType.value === 'quickview'
+					? 'Dashboard-Name ist erforderlich.'
+					: 'GUID ist erforderlich.'
+				: undefined
+	});
+
+	if (!identifierValue) {
+		return undefined;
+	}
+
+	return {
+		contextType: contextType.value,
+		dashboardId: identifierValue.trim(),
+		displayName: existingTitle,
+		flowVersionState: existingConfig?.flowVersionState
+	};
+}
+
+function getContextLabel(contextType: DashboardContextType | undefined): string {
+	return contextType === 'flow' ? 'Flow' : 'Quickview';
+}
+
+function getWorkspaceLabel(localConfig: LocalConfig): string {
+	if (localConfig.contextType === 'flow' && localConfig.displayName?.trim()) {
+		return `${localConfig.dashboardId} (${localConfig.displayName.trim()})`;
+	}
+
+	return localConfig.dashboardId;
+}
+
+async function persistFlowDisplayName(config: RuntimeConfig, fetchedTitle: string | undefined): Promise<void> {
+	if (config.localConfig.contextType !== 'flow') {
+		return;
+	}
+
+	const normalizedTitle = fetchedTitle?.trim();
+	if (!normalizedTitle) {
+		return;
+	}
+
+	if (config.localConfig.displayName === normalizedTitle) {
+		return;
+	}
+
+	config.localConfig.displayName = normalizedTitle;
+	await writeJsonFile(config.localConfigUri, config.localConfig);
+}
+
+function normalizeLocalConfig(localConfig: LocalConfig | undefined): LocalConfig | undefined {
+	if (!localConfig) {
+		return undefined;
+	}
+
+	return {
+		contextType: localConfig.contextType ?? 'quickview',
+		dashboardId: localConfig.dashboardId?.trim() ?? '',
+		displayName: localConfig.displayName?.trim() ? localConfig.displayName.trim() : undefined,
+		flowVersionState: localConfig.flowVersionState
+			? {
+				lastPromptDate: localConfig.flowVersionState.lastPromptDate?.trim() || undefined,
+				pendingBump: localConfig.flowVersionState.pendingBump
+			}
+			: undefined
+	};
 }
 
 async function migrateDeprecatedSettings(settings: vscode.WorkspaceConfiguration): Promise<void> {
@@ -574,13 +684,21 @@ async function deleteCredentialsFromSecretStorage(workspaceFolder: vscode.Worksp
 	await extensionContext.secrets.delete(key);
 }
 
-async function fetchDashboardRows(config: RuntimeConfig): Promise<DbRow[]> {
+async function fetchWorkspaceRows(config: RuntimeConfig): Promise<DbRow[]> {
+	if (config.localConfig.contextType === 'flow') {
+		return fetchFlowRows(config);
+	}
+
+	return fetchQuickviewRows(config);
+}
+
+async function fetchQuickviewRows(config: RuntimeConfig): Promise<DbRow[]> {
 	const executeFetch = async (includeAnpVersion: boolean): Promise<string> => {
-		const sql = buildDashboardSql(config.localConfig.dashboardId, includeAnpVersion);
+		const sql = buildQuickviewSql(config.localConfig.dashboardId, includeAnpVersion);
 		const fetchUrl = new URL(config.dbFetchJsonUrl);
 		fetchUrl.searchParams.set('sql', sql);
 		OUTPUT_CHANNEL.appendLine('[DBFetch] ---- BEGIN REQUEST ----');
-		OUTPUT_CHANNEL.appendLine(`[DBFetch] Dashboard: ${config.localConfig.dashboardId}`);
+		OUTPUT_CHANNEL.appendLine(`[DBFetch] Quickview: ${config.localConfig.dashboardId}`);
 		OUTPUT_CHANNEL.appendLine(`[DBFetch] Endpoint: ${config.dbFetchJsonUrl}`);
 		OUTPUT_CHANNEL.appendLine(`[DBFetch] Mode: ${includeAnpVersion ? 'with ANP_VERSION' : 'without ANP_VERSION (fallback)'}`);
 		OUTPUT_CHANNEL.appendLine(`[DBFetch] Request URL (encoded): ${fetchUrl.toString()}`);
@@ -609,6 +727,31 @@ async function fetchDashboardRows(config: RuntimeConfig): Promise<DbRow[]> {
 		responseText = await executeFetch(false);
 	}
 
+	return parseWorkspaceRows(responseText, config, 'quickview');
+}
+
+async function fetchFlowRows(config: RuntimeConfig): Promise<DbRow[]> {
+	const sql = buildFlowSql(config.localConfig.dashboardId);
+	const fetchUrl = new URL(config.dbFetchJsonUrl);
+	fetchUrl.searchParams.set('sql', sql);
+	OUTPUT_CHANNEL.appendLine('[DBFetch] ---- BEGIN REQUEST ----');
+	OUTPUT_CHANNEL.appendLine(`[DBFetch] Flowboard: ${config.localConfig.dashboardId}`);
+	OUTPUT_CHANNEL.appendLine(`[DBFetch] Endpoint: ${config.dbFetchJsonUrl}`);
+	OUTPUT_CHANNEL.appendLine(`[DBFetch] Request URL (encoded): ${fetchUrl.toString()}`);
+	OUTPUT_CHANNEL.appendLine('[DBFetch] SQL (decoded):');
+	OUTPUT_CHANNEL.appendLine(sql);
+	OUTPUT_CHANNEL.appendLine('[DBFetch] ---- END REQUEST ----');
+
+	const responseText = await requestText({
+		method: 'GET',
+		url: fetchUrl.toString(),
+		config
+	});
+
+	return parseWorkspaceRows(responseText, config, 'flow');
+}
+
+async function parseWorkspaceRows(responseText: string, config: RuntimeConfig, contextType: DashboardContextType): Promise<DbRow[]> {
 	if (!responseText || responseText.trim().length === 0) {
 		OUTPUT_CHANNEL.appendLine('[DBFetch] Leere Antwort erhalten (Body length = 0).');
 		throw new Error(
@@ -629,7 +772,7 @@ async function fetchDashboardRows(config: RuntimeConfig): Promise<DbRow[]> {
 	OUTPUT_CHANNEL.appendLine(`[DBFetch] Parsed JSON elements: ${list.length}`);
 
 	return list
-		.map((item) => normalizeDbRow(item))
+		.map((item) => normalizeDbRow(item, contextType))
 		.filter((item): item is DbRow => item !== undefined);
 }
 
@@ -707,81 +850,141 @@ function logJsonErrorContext(input: string, error: unknown, stage: string): void
 
 async function materializeFiles(config: RuntimeConfig, rows: DbRow[]): Promise<FileIndex> {
 	const entries: FileIndexEntry[] = [];
-	const dashboardFolderName = sanitizePathPart(config.localConfig.dashboardId);
-	const dashboardDir = vscode.Uri.joinPath(
-		config.workspaceFolder.uri,
-		config.generatedRootDir,
-		dashboardFolderName
-	);
-	await vscode.workspace.fs.createDirectory(dashboardDir);
+	const rootName = sanitizePathPart(config.localConfig.dashboardId);
+	const rootDir = vscode.Uri.joinPath(config.workspaceFolder.uri, config.generatedRootDir, config.localConfig.contextType, rootName);
+	await vscode.workspace.fs.createDirectory(rootDir);
 
 	for (const row of rows) {
-		const recordDir = vscode.Uri.joinPath(dashboardDir, row.type.toLowerCase());
-		await vscode.workspace.fs.createDirectory(recordDir);
-
-		const fileNameParts = [sanitizePathPart(row.name)];
-		if (row.title.trim().length > 0) {
-			fileNameParts.push(sanitizePathPart(row.title));
-		}
-		fileNameParts.push(sanitizePathPart(row.guid));
-		const fileBaseName = fileNameParts.join('__');
-		const jsRelativePath = toPosixPath(
-			path.join(config.generatedRootDir, dashboardFolderName, row.type.toLowerCase(), `${fileBaseName}.js`)
-		);
-		const cssRelativePath = toPosixPath(
-			path.join(config.generatedRootDir, dashboardFolderName, row.type.toLowerCase(), `${fileBaseName}.css`)
-		);
-
-		await writeTextFile(vscode.Uri.joinPath(recordDir, `${fileBaseName}.js`), row.jsPageScript ?? '');
-		await writeTextFile(vscode.Uri.joinPath(recordDir, `${fileBaseName}.css`), row.cssStyle ?? '');
-		if (row.type === 'QUERY') {
-			await writeTextFile(vscode.Uri.joinPath(recordDir, `${fileBaseName}.sql`), row.statement ?? '');
-		}
-
-		entries.push({
-			relativePath: jsRelativePath,
-			table: row.type === 'QUERY' ? 'QVQUERY' : 'QVDASHBOARD',
-			field: 'JSPAGESCRIPT',
-			versionField: row.type === 'QUERY' ? 'VERSION' : 'ANP_VERSION',
-			guid: row.guid,
-			recordName: row.title.trim().length > 0 ? `${row.name} - ${row.title}` : row.name,
-			type: row.type,
-			version: row.version
-		});
-
-		entries.push({
-			relativePath: cssRelativePath,
-			table: row.type === 'QUERY' ? 'QVQUERY' : 'QVDASHBOARD',
-			field: 'CSSSTYLE',
-			versionField: row.type === 'QUERY' ? 'VERSION' : 'ANP_VERSION',
-			guid: row.guid,
-			recordName: row.title.trim().length > 0 ? `${row.name} - ${row.title}` : row.name,
-			type: row.type,
-			version: row.version
-		});
-
-		if (row.type === 'QUERY') {
-			const sqlRelativePath = toPosixPath(
-				path.join(config.generatedRootDir, dashboardFolderName, row.type.toLowerCase(), `${fileBaseName}.sql`)
-			);
-			entries.push({
-				relativePath: sqlRelativePath,
-				table: 'QVQUERY',
-				field: 'STATEMENT',
-				versionField: 'VERSION',
-				guid: row.guid,
-				recordName: row.title.trim().length > 0 ? `${row.name} - ${row.title}` : row.name,
-				type: row.type,
-				version: row.version
-			});
+		if (config.localConfig.contextType === 'flow') {
+			await materializeFlowRow(config, rootDir, rootName, row, entries);
+		} else {
+			await materializeQuickviewRow(config, rootDir, rootName, row, entries);
 		}
 	}
 
 	return {
 		generatedAt: new Date().toISOString(),
+		contextType: config.localConfig.contextType,
 		dashboardId: config.localConfig.dashboardId,
 		entries
 	};
+}
+
+async function materializeQuickviewRow(
+	config: RuntimeConfig,
+	rootDir: vscode.Uri,
+	rootName: string,
+	row: DbRow,
+	entries: FileIndexEntry[]
+): Promise<void> {
+	const recordDir = vscode.Uri.joinPath(rootDir, row.type.toLowerCase());
+	await vscode.workspace.fs.createDirectory(recordDir);
+
+	const fileNameParts = [sanitizePathPart(row.name)];
+	if (row.title.trim().length > 0) {
+		fileNameParts.push(sanitizePathPart(row.title));
+	}
+	fileNameParts.push(sanitizePathPart(row.guid));
+	const fileBaseName = fileNameParts.join('__');
+	const jsRelativePath = toPosixPath(path.join(config.generatedRootDir, config.localConfig.contextType, rootName, row.type.toLowerCase(), `${fileBaseName}.js`));
+	const cssRelativePath = toPosixPath(path.join(config.generatedRootDir, config.localConfig.contextType, rootName, row.type.toLowerCase(), `${fileBaseName}.css`));
+
+	await writeTextFile(vscode.Uri.joinPath(recordDir, `${fileBaseName}.js`), row.jsPageScript ?? '');
+	await writeTextFile(vscode.Uri.joinPath(recordDir, `${fileBaseName}.css`), row.cssStyle ?? '');
+	if (row.type === 'QUERY') {
+		await writeTextFile(vscode.Uri.joinPath(recordDir, `${fileBaseName}.sql`), row.statement ?? '');
+	}
+
+	entries.push({
+		relativePath: jsRelativePath,
+		table: row.type === 'QUERY' ? 'QVQUERY' : 'QVDASHBOARD',
+		field: 'JSPAGESCRIPT',
+		versionField: row.type === 'QUERY' ? 'VERSION' : 'ANP_VERSION',
+		guid: row.guid,
+		recordName: row.title.trim().length > 0 ? `${row.name} - ${row.title}` : row.name,
+		type: row.type,
+		version: row.version,
+		contextType: 'quickview'
+	});
+
+	entries.push({
+		relativePath: cssRelativePath,
+		table: row.type === 'QUERY' ? 'QVQUERY' : 'QVDASHBOARD',
+		field: 'CSSSTYLE',
+		versionField: row.type === 'QUERY' ? 'VERSION' : 'ANP_VERSION',
+		guid: row.guid,
+		recordName: row.title.trim().length > 0 ? `${row.name} - ${row.title}` : row.name,
+		type: row.type,
+		version: row.version,
+		contextType: 'quickview'
+	});
+
+	if (row.type === 'QUERY') {
+		const sqlRelativePath = toPosixPath(path.join(config.generatedRootDir, config.localConfig.contextType, rootName, row.type.toLowerCase(), `${fileBaseName}.sql`));
+		entries.push({
+			relativePath: sqlRelativePath,
+			table: 'QVQUERY',
+			field: 'STATEMENT',
+			versionField: 'VERSION',
+			guid: row.guid,
+			recordName: row.title.trim().length > 0 ? `${row.name} - ${row.title}` : row.name,
+			type: row.type,
+			version: row.version,
+			contextType: 'quickview'
+		});
+	}
+}
+
+async function materializeFlowRow(
+	config: RuntimeConfig,
+	rootDir: vscode.Uri,
+	rootName: string,
+	row: DbRow,
+	entries: FileIndexEntry[]
+): Promise<void> {
+	const fileBaseName = sanitizePathPart(row.guid);
+	const flowRecordDir = vscode.Uri.joinPath(rootDir, fileBaseName);
+	await vscode.workspace.fs.createDirectory(flowRecordDir);
+
+	const xmlRelativePath = toPosixPath(path.join(config.generatedRootDir, config.localConfig.contextType, rootName, fileBaseName, `${fileBaseName}.xml`));
+	const jsRelativePath = toPosixPath(path.join(config.generatedRootDir, config.localConfig.contextType, rootName, fileBaseName, `${fileBaseName}.js`));
+	const sqlRelativePath = toPosixPath(path.join(config.generatedRootDir, config.localConfig.contextType, rootName, fileBaseName, `${fileBaseName}.sql`));
+
+	await writeTextFile(vscode.Uri.joinPath(flowRecordDir, `${fileBaseName}.xml`), row.xmlDefinition ?? '');
+	await writeTextFile(vscode.Uri.joinPath(flowRecordDir, `${fileBaseName}.js`), row.javascript ?? '');
+	await writeTextFile(vscode.Uri.joinPath(flowRecordDir, `${fileBaseName}.sql`), row.sqlStatement ?? '');
+
+	const recordName = row.title.trim().length > 0 ? `${row.title.trim()} (${row.guid})` : row.guid;
+	entries.push({
+		relativePath: xmlRelativePath,
+		table: 'FLOWBOARD',
+		field: 'XMLDEFINITION',
+		guid: row.guid,
+		recordName,
+		type: 'DASHBOARD',
+		version: row.version,
+		contextType: 'flow'
+	});
+	entries.push({
+		relativePath: jsRelativePath,
+		table: 'FLOWBOARD',
+		field: 'JAVASCRIPT',
+		guid: row.guid,
+		recordName,
+		type: 'DASHBOARD',
+		version: row.version,
+		contextType: 'flow'
+	});
+	entries.push({
+		relativePath: sqlRelativePath,
+		table: 'FLOWBOARD',
+		field: 'SQLSTATEMENT',
+		guid: row.guid,
+		recordName,
+		type: 'DASHBOARD',
+		version: row.version,
+		contextType: 'flow'
+	});
 }
 
 async function writeIndex(config: RuntimeConfig, index: FileIndex): Promise<void> {
@@ -795,18 +998,22 @@ async function readIndex(config: RuntimeConfig): Promise<FileIndex | undefined> 
 }
 
 async function pushUpdate(config: RuntimeConfig, entry: FileIndexEntry, content: string): Promise<void> {
-	const versionValue = formatVersionStamp(new Date());
-	const versionField = entry.versionField ?? getVersionFieldForRecordType(entry.type);
-	const updateDataRow = buildUpdateDataRow([
-		{ field: entry.field, value: content },
-		{ field: versionField, value: versionValue }
-	]);
+	const versionField = entry.contextType === 'quickview' ? entry.versionField ?? getVersionFieldForRecordType(entry.type) : entry.versionField;
+	const updateFields: Array<{ field: FileIndexEntry['field'] | FileIndexEntry['versionField']; value: string }> = [
+		{ field: entry.field, value: content }
+	];
+	if (versionField) {
+		updateFields.push({ field: versionField, value: formatVersionStamp(new Date()) });
+	}
+	const updateDataRow = buildUpdateDataRow(updateFields);
 	const updateData = toCData(updateDataRow);
 	const whereClause = `GUID='${escapeSqlString(entry.guid)}'`;
 	OUTPUT_CHANNEL.appendLine('[SaveSync] ---- BEGIN REQUEST ----');
 	OUTPUT_CHANNEL.appendLine('[SaveSync] Transport: soap12');
 	OUTPUT_CHANNEL.appendLine(`[SaveSync] Target: ${entry.table}.${entry.field}`);
-	OUTPUT_CHANNEL.appendLine(`[SaveSync] Version target: ${entry.table}.${versionField}=${versionValue}`);
+	if (versionField) {
+		OUTPUT_CHANNEL.appendLine(`[SaveSync] Version target: ${entry.table}.${versionField}=${formatVersionStamp(new Date())}`);
+	}
 	OUTPUT_CHANNEL.appendLine(`[SaveSync] Record: ${entry.recordName} (${entry.type})`);
 	OUTPUT_CHANNEL.appendLine(`[SaveSync] GUID: ${entry.guid}`);
 	OUTPUT_CHANNEL.appendLine(`[SaveSync] Content length: ${content.length}`);
@@ -1176,7 +1383,7 @@ function describeAuthIdentity(username: string, domain: string): string {
 	return `${usernameHint}, ${domainHint}`;
 }
 
-function buildDashboardSql(dashboardId: string, includeAnpVersion: boolean): string {
+function buildQuickviewSql(dashboardId: string, includeAnpVersion: boolean): string {
 	const sanitizedId = escapeSqlString(dashboardId);
 	const anpQueryField = includeAnpVersion
 		? "COALESCE(CAST(qvdashboard.anp_version as varchar(50)), '') as ANP_VERSION"
@@ -1199,6 +1406,11 @@ from QVDASHBOARD
 where QVDASHBOARD.QVDASHBOARD = '${sanitizedId}'`;
 }
 
+function buildFlowSql(flowGuid: string): string {
+	const sanitizedGuid = escapeSqlString(flowGuid);
+	return `select FLOWBOARD.GUID,FLOWBOARD.TITLE,FLOWBOARD.XMLDEFINITION,FLOWBOARD.JAVASCRIPT,FLOWBOARD.SQLSTATEMENT,FLOWBOARD.MAJORVERSION,FLOWBOARD.MINORVERSION,FLOWBOARD.PATCHVERSION from FLOWBOARD where FLOWBOARD.GUID = '${sanitizedGuid}'`;
+}
+
 function extractXmlStringValue(xmlText: string): string {
 	const parsed = XML_PARSER.parse(xmlText) as { string?: string | { '#text'?: string } };
 	const value = parsed.string;
@@ -1214,12 +1426,39 @@ function extractXmlStringValue(xmlText: string): string {
 	throw new Error('dbFetchJSON Antwort enthaelt kein <string>-Element.');
 }
 
-function normalizeDbRow(raw: unknown): DbRow | undefined {
+function normalizeDbRow(raw: unknown, contextType: DashboardContextType): DbRow | undefined {
 	if (!raw || typeof raw !== 'object') {
 		return undefined;
 	}
 
 	const obj = raw as Record<string, unknown>;
+	if (contextType === 'flow') {
+		const guid = String(pick(obj, ['guid', 'GUID']) ?? '').trim();
+		if (!guid) {
+			return undefined;
+		}
+
+		const title = String(pick(obj, ['title', 'TITLE']) ?? '').trim();
+		const majorVersion = String(pick(obj, ['majorversion', 'MAJORVERSION']) ?? '').trim();
+		const minorVersion = String(pick(obj, ['minorversion', 'MINORVERSION']) ?? '').trim();
+		const patchVersion = String(pick(obj, ['patchversion', 'PATCHVERSION']) ?? '').trim();
+		const version = [majorVersion, minorVersion, patchVersion].filter((part) => part.length > 0).join('.');
+
+		return {
+			name: title || guid,
+			title,
+			guid,
+			xmlDefinition: String(pick(obj, ['xmldefinition', 'XMLDEFINITION']) ?? ''),
+			javascript: String(pick(obj, ['javascript', 'JAVASCRIPT']) ?? ''),
+			sqlStatement: String(pick(obj, ['sqlstatement', 'SQLSTATEMENT']) ?? ''),
+			statement: '',
+			jsPageScript: '',
+			cssStyle: '',
+			version,
+			type: 'DASHBOARD'
+		};
+	}
+
 	const typeValue = String(pick(obj, ['type', 'TYPE']) ?? '').toUpperCase();
 	if (typeValue !== 'QUERY' && typeValue !== 'DASHBOARD') {
 		return undefined;

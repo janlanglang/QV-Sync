@@ -39,6 +39,12 @@
         "title": "ERP Dashboard Sync: Clear Credentials (Secret Storage)"
       }
     ],
+    "jsonValidation": [
+      {
+        "fileMatch": "**/.erp-dashboard-sync.json",
+        "url": "./schemas/erp-dashboard-sync.schema.json"
+      }
+    ],
     "configuration": {
       "title": "ERP Dashboard Sync",
       "properties": {
@@ -104,17 +110,17 @@
         "erpDashboardSync.configFileName": {
           "type": "string",
           "default": ".erp-dashboard-sync.json",
-          "description": "Workspace file storing dashboard name and local ERP sync metadata."
+          "description": "Workspace file storing the context type, workspace identifier, optional Flow title and Flow version state."
         },
         "erpDashboardSync.indexFileName": {
           "type": "string",
           "default": ".erp-dashboard-sync-index.json",
-          "description": "Workspace file mapping generated JS/CSS files to ERP rows and fields."
+          "description": "Workspace file mapping generated files to ERP rows and fields for Quickview and Flow."
         },
         "erpDashboardSync.generatedRootDir": {
           "type": "string",
           "default": "erp-dashboard",
-          "description": "Folder where dashboard JS/CSS files are generated."
+          "description": "Folder where generated Quickview and Flow workspace files are stored."
         }
       }
     }

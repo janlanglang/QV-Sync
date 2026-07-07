@@ -1,0 +1,39 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "erp-dashboard-sync.schema.json",
+  "title": "ERP Dashboard Sync Workspace Config",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contextType", "dashboardId"],
+  "properties": {
+    "contextType": {
+      "type": "string",
+      "enum": ["quickview", "flow"],
+      "description": "Controls whether the workspace loads Quickview or Flowboard data."
+    },
+    "dashboardId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Quickview dashboard name or Flow GUID."
+    },
+    "displayName": {
+      "type": "string",
+      "description": "Optional human-readable label. For Flow, this is typically the TITLE fetched from the database."
+    },
+    "flowVersionState": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "lastPromptDate": {
+          "type": "string",
+          "description": "Date when the Flow version bump prompt was last shown, formatted as YYYY-MM-DD."
+        },
+        "pendingBump": {
+          "type": "string",
+          "enum": ["majorversion", "minorversion", "patchversion"],
+          "description": "Version field selected for the next Flow save operation."
+        }
+      }
+    }
+  }
+}
