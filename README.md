@@ -71,6 +71,8 @@ Hinweis:
 
 - `erpDashboardSync.dbFetchJsonUrl`
 - `erpDashboardSync.xmlUpdateOfflineSoapUrl`
+- Empfehlung: `xmlUpdateOfflineSoapUrl` als expliziten Methoden-Endpunkt setzen (`.../utils.asmx/xmlUpdateOffline`).
+- Kompatibilitaet: `.../utils.asmx` funktioniert weiterhin; die Extension probiert intern beide Varianten.
 - Update-Transport ist fest auf SOAP 1.2.
 - `erpDashboardSync.authMode` (`none` or `ntlm`)
 - `erpDashboardSync.autoSyncOnSave`

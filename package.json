@@ -2,7 +2,7 @@
   "name": "erp-dashboard-sync",
   "displayName": "ERP Dashboard Sync",
   "description": "Sync JS/CSS files between VS Code workspace and APplus ERP dashboard",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "vscode": "^1.118.0"
@@ -60,8 +60,8 @@
         },
         "erpDashboardSync.xmlUpdateOfflineSoapUrl": {
           "type": "string",
-          "default": "https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/utils.asmx",
-          "description": "ERP SOAP endpoint for xmlUpdateOffline (SOAP 1.2)."
+          "default": "https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/utils.asmx/xmlUpdateOffline",
+          "description": "ERP SOAP endpoint for xmlUpdateOffline (SOAP 1.2). Both .../utils.asmx and .../utils.asmx/xmlUpdateOffline are supported."
         },
         "erpDashboardSync.tlsAllowInsecure": {
           "type": "boolean",

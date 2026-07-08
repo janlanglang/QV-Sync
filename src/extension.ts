@@ -33,6 +33,7 @@ interface RuntimeConfig {
 	localConfig: LocalConfig;
 	dbFetchJsonUrl: string;
 	xmlUpdateOfflineSoapUrl: string;
+	xmlUpdateOfflineRequestUrls: string[];
 	tlsAllowInsecure: boolean;
 	authMode: AuthMode;
 	authUsername: string;
@@ -312,8 +313,9 @@ async function loadRuntimeConfig(
 		),
 		xmlUpdateOfflineSoapUrl: settings.get<string>(
 			'xmlUpdateOfflineSoapUrl',
-			'https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/utils.asmx'
+			'https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/utils.asmx/xmlUpdateOffline'
 		),
+		xmlUpdateOfflineRequestUrls: [],
 		tlsAllowInsecure: settings.get<boolean>('tlsAllowInsecure', false),
 		authMode: settings.get<AuthMode>('authMode', 'ntlm'),
 		authUsername,
@@ -326,6 +328,7 @@ async function loadRuntimeConfig(
 		indexFileName: settings.get<string>('indexFileName', '.erp-dashboard-sync-index.json'),
 		generatedRootDir: settings.get<string>('generatedRootDir', 'erp-dashboard')
 	};
+	runtimeConfig.xmlUpdateOfflineRequestUrls = buildXmlUpdateOfflineRequestUrls(runtimeConfig.xmlUpdateOfflineSoapUrl);
 
 	if (authUsernameRaw !== authUsername || authDomainRaw !== authDomain || authWorkstationRaw !== authWorkstation) {
 		OUTPUT_CHANNEL.appendLine(
@@ -1107,19 +1110,36 @@ async function pushUpdate(config: RuntimeConfig, entry: FileIndexEntry, content:
 
 	const soapBody = buildSoapEnvelope(entry.table, updateData, whereClause);
 	OUTPUT_CHANNEL.appendLine(`[SaveSync] Method: POST`);
-	OUTPUT_CHANNEL.appendLine(`[SaveSync] Endpoint: ${config.xmlUpdateOfflineSoapUrl}`);
+	OUTPUT_CHANNEL.appendLine(`[SaveSync] Configured endpoint: ${config.xmlUpdateOfflineSoapUrl}`);
 	OUTPUT_CHANNEL.appendLine(`[SaveSync] Headers: Content-Type=application/soap+xml; charset=utf-8`);
 	OUTPUT_CHANNEL.appendLine('[SaveSync] Body (SOAP 1.2):');
 	OUTPUT_CHANNEL.appendLine(soapBody);
-	await requestText({
-		method: 'POST',
-		url: config.xmlUpdateOfflineSoapUrl,
-		headers: {
-			'Content-Type': 'application/soap+xml; charset=utf-8'
-		},
-		body: soapBody,
-		config
-	});
+
+	let lastError: unknown;
+	for (let index = 0; index < config.xmlUpdateOfflineRequestUrls.length; index += 1) {
+		const endpoint = config.xmlUpdateOfflineRequestUrls[index];
+		OUTPUT_CHANNEL.appendLine(`[SaveSync] Endpoint candidate ${index + 1}/${config.xmlUpdateOfflineRequestUrls.length}: ${endpoint}`);
+		try {
+			await requestText({
+				method: 'POST',
+				url: endpoint,
+				headers: {
+					'Content-Type': 'application/soap+xml; charset=utf-8'
+				},
+				body: soapBody,
+				config
+			});
+			lastError = undefined;
+			break;
+		} catch (error) {
+			lastError = error;
+			OUTPUT_CHANNEL.appendLine(`[SaveSync] Endpoint candidate fehlgeschlagen: ${formatError(error)}`);
+		}
+	}
+
+	if (lastError) {
+		throw lastError;
+	}
 	OUTPUT_CHANNEL.appendLine('[SaveSync] ---- END REQUEST ----');
 	if (versionValue !== undefined) {
 		entry.version = versionValue;
@@ -1129,6 +1149,32 @@ async function pushUpdate(config: RuntimeConfig, entry: FileIndexEntry, content:
 	}
 
 	return true;
+}
+
+function buildXmlUpdateOfflineRequestUrls(configuredUrl: string): string[] {
+	const trimmed = configuredUrl.trim();
+	if (!trimmed) {
+		throw new Error('erpDashboardSync.xmlUpdateOfflineSoapUrl darf nicht leer sein.');
+	}
+
+	const candidates: string[] = [];
+	const addCandidate = (value: string): void => {
+		const normalized = value.replace(/\/+$/, '');
+		if (!normalized || candidates.includes(normalized)) {
+			return;
+		}
+
+		candidates.push(normalized);
+	};
+
+	addCandidate(trimmed);
+	if (/\/xmlUpdateOffline\/?$/i.test(trimmed)) {
+		addCandidate(trimmed.replace(/\/xmlUpdateOffline\/?$/i, ''));
+	} else if (/\.asmx\/?$/i.test(trimmed)) {
+		addCandidate(`${trimmed.replace(/\/+$/, '')}/xmlUpdateOffline`);
+	}
+
+	return candidates;
 }
 
 function buildUpdateDataRow(fields: Array<{ field: string; value: string }>): string {

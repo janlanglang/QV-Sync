@@ -2,7 +2,7 @@
 {
 	// ERP Dashboard Sync defaults for your environment.
 	"erpDashboardSync.dbFetchJsonUrl": "http://systec-vs74/APplusdeploy/flexmobility/customutils.asmx/dbFetchJSON",
-	"erpDashboardSync.xmlUpdateOfflineSoapUrl": "http://systec-vs74/APplusdeploy/flexmobility/utils.asmx",
+	"erpDashboardSync.xmlUpdateOfflineSoapUrl": "http://systec-vs74/APplusdeploy/flexmobility/utils.asmx/xmlUpdateOffline",
 	"erpDashboardSync.tlsAllowInsecure": true,
 	"erpDashboardSync.authMode": "ntlm",
 	"erpDashboardSync.authUsername": "",
