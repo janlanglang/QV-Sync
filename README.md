@@ -71,6 +71,7 @@ Hinweis:
 
 - `erpDashboardSync.dbFetchJsonUrl`
 - `erpDashboardSync.xmlUpdateOfflineSoapUrl`
+- `erpDashboardSync.verboseLogging`
 - Empfehlung: `xmlUpdateOfflineSoapUrl` als expliziten Methoden-Endpunkt setzen (`.../utils.asmx/xmlUpdateOffline`).
 - Kompatibilitaet: `.../utils.asmx` funktioniert weiterhin; die Extension probiert intern beide Varianten.
 - Update-Transport ist fest auf SOAP 1.2.
@@ -81,6 +82,13 @@ Hinweis:
 - `erpDashboardSync.configFileName`
 - `erpDashboardSync.indexFileName`
 - `erpDashboardSync.generatedRootDir`
+
+### Logging
+
+- Standardmaessig schreibt die Extension kompakte Logs mit Zeitstempel in den Output-Channel `ERP Dashboard Sync`.
+- `erpDashboardSync.verboseLogging = true` schaltet ausfuehrliche Debug-Logs zu.
+- In diesem Modus werden auch komplette SQL-Abfragen, SOAP-Payloads und rohe ERP-Antworten geloggt.
+- Empfehlung: Nur temporaer fuer Fehlersuche aktivieren, weil die Log-Ausgabe deutlich groesser wird.
 
 ## Versionierungslogik
 

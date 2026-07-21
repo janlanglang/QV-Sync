@@ -8,6 +8,10 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 - No changes yet.
 
+## [0.3.5] - 2026-07-21
+
+- Updated extension icon file.
+
 ## [0.2.0] - 2026-07-01
 
 - Added support for dashboard version handling via `ANP_VERSION`.

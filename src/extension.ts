@@ -34,6 +34,7 @@ interface RuntimeConfig {
 	dbFetchJsonUrl: string;
 	xmlUpdateOfflineSoapUrl: string;
 	xmlUpdateOfflineRequestUrls: string[];
+	verboseLogging: boolean;
 	tlsAllowInsecure: boolean;
 	authMode: AuthMode;
 	authUsername: string;
@@ -102,6 +103,18 @@ const SECRET_STORAGE_PREFIX = 'erp-dashboard-sync';
 let deprecatedSettingsMigrationCompleted = false;
 let extensionContext: vscode.ExtensionContext | undefined;
 
+function logOutput(message: string): void {
+	OUTPUT_CHANNEL.appendLine(`[${new Date().toISOString()}] ${message}`);
+}
+
+function logVerbose(config: RuntimeConfig, message: string): void {
+	if (!config.verboseLogging) {
+		return;
+	}
+
+	logOutput(message);
+}
+
 export function activate(context: vscode.ExtensionContext): void {
 	extensionContext = context;
 	context.subscriptions.push(OUTPUT_CHANNEL);
@@ -166,6 +179,11 @@ async function initializeWorkspace(promptForDashboard: boolean): Promise<void> {
 			progress.report({ message: 'Konfiguration laden...' });
 			const config = await loadRuntimeConfig(workspaceFolder, promptForDashboard);
 			if (!config) {
+				if (!promptForDashboard) {
+					vscode.window.showInformationMessage(
+						'ERP Dashboard Sync: Keine lokale Konfiguration gefunden. Bitte zuerst "Initialize Workspace" ausfuehren oder eine .erp-dashboard-sync.json bereitstellen.'
+					);
+				}
 				return;
 			}
 
@@ -220,41 +238,73 @@ async function triggerStartupReloadIfConfigured(): Promise<void> {
 		}
 	}
 
-	OUTPUT_CHANNEL.appendLine(`[StartupReload] Starte Reload fuer ${getContextLabel(localConfig.contextType)} '${workspaceLabel}'.`);
+	logOutput(`[StartupReload] Starte Reload fuer ${getContextLabel(localConfig.contextType)} '${workspaceLabel}'.`);
 	await initializeWorkspace(false);
 }
 
 async function syncDocumentOnSave(document: vscode.TextDocument): Promise<void> {
 	const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
 	if (!workspaceFolder) {
+		logOutput(`[SaveSync] Skip: Datei ausserhalb Workspace gespeichert: ${document.uri.fsPath}`);
 		return;
 	}
 
 	const config = await loadRuntimeConfig(workspaceFolder, false);
-	if (!config || !config.autoSyncOnSave) {
+	if (!config) {
+		logOutput('[SaveSync] Skip: Keine gueltige lokale Konfiguration gefunden.');
+		return;
+	}
+
+	if (!config.autoSyncOnSave) {
+		logOutput('[SaveSync] Skip: autoSyncOnSave ist deaktiviert.');
 		return;
 	}
 
 	const index = await readIndex(config);
 	if (!index) {
+		logOutput(`[SaveSync] Skip: Indexdatei nicht gefunden oder ungueltig (${config.indexFileName}).`);
 		return;
 	}
 
 	const managedLanguages = config.localConfig.contextType === 'flow' ? ['xml', 'javascript', 'sql'] : ['javascript', 'css', 'sql'];
 	if (!managedLanguages.includes(document.languageId)) {
+		logOutput(
+			`[SaveSync] Skip: Sprache '${document.languageId}' wird fuer ${config.localConfig.contextType} nicht synchronisiert.`
+		);
 		return;
 	}
 
 	const relativePath = toPosixPath(path.relative(workspaceFolder.uri.fsPath, document.uri.fsPath));
-	const entry = index.entries.find((item) => item.relativePath === relativePath);
+	const pathMatch = findIndexEntryByRelativePath(
+		index,
+		relativePath,
+		config.localConfig.contextType,
+		config.generatedRootDir
+	);
+	let entry = pathMatch.entry;
+	if (entry && pathMatch.matchKind === 'case-insensitive') {
+		logOutput(
+			`[SaveSync] Hinweis: Datei ueber case-insensitive Pfadabgleich gefunden (${relativePath} vs ${entry.relativePath}).`
+		);
+	}
+	if (entry && pathMatch.matchKind === 'legacy-layout') {
+		logOutput(
+			`[SaveSync] Hinweis: Datei ueber Legacy-Pfadabgleich gefunden (${relativePath} vs ${entry.relativePath}).`
+		);
+		entry.relativePath = relativePath;
+	}
 	if (!entry) {
+		logOutput(`[SaveSync] Skip: Datei nicht im Index enthalten (${relativePath}).`);
 		return;
 	}
+
+	logOutput(`[SaveSync] Trigger: ${relativePath} -> ${entry.table}.${entry.field}`);
 
 	entry.contextType ??= config.localConfig.contextType;
 
 	if (entry.contextType === 'quickview') {
 		entry.versionField ??= getVersionFieldForRecordType(entry.type);
+		alignQuickviewVersionFromSiblingEntries(index, entry);
 	}
 
 	try {
@@ -263,12 +313,77 @@ async function syncDocumentOnSave(document: vscode.TextDocument): Promise<void> 
 			vscode.window.setStatusBarMessage('ERP Sync: Update abgebrochen', 2500);
 			return;
 		}
+
+		try {
+			propagateVersionToSiblingEntries(index, entry);
+			await writeIndex(config, index);
+		} catch (writeError) {
+			logOutput(`[SaveSync] Hinweis: Index konnte nach erfolgreichem Update nicht geschrieben werden: ${formatError(writeError)}`);
+			vscode.window.showWarningMessage(
+				'ERP Dashboard Sync: Update wurde gespeichert, aber der lokale Index konnte nicht aktualisiert werden. Bitte Output-Channel pruefen.'
+			);
+		}
+
 		vscode.window.setStatusBarMessage(`ERP Sync: ${entry.recordName} (${entry.field}) aktualisiert`, 2500);
 	} catch (error) {
-		OUTPUT_CHANNEL.appendLine(`Save-Sync fehlgeschlagen fuer ${relativePath}: ${formatError(error)}`);
+		logOutput(`Save-Sync fehlgeschlagen fuer ${relativePath}: ${formatError(error)}`);
 		vscode.window.showErrorMessage(
 			`ERP Dashboard Sync: Update fehlgeschlagen fuer ${entry.recordName} (${entry.field}). Details im Output-Channel.`
 		);
+	}
+}
+
+function alignQuickviewVersionFromSiblingEntries(index: FileIndex, entry: FileIndexEntry): void {
+	const currentVersion = entry.version.trim();
+	if (isDateVersionFormat(currentVersion)) {
+		return;
+	}
+
+	const sibling = index.entries.find((candidate) => {
+		if (candidate === entry) {
+			return false;
+		}
+
+		if (candidate.contextType !== 'quickview' || candidate.guid !== entry.guid) {
+			return false;
+		}
+
+		const candidateVersionField = candidate.versionField ?? getVersionFieldForRecordType(candidate.type);
+		const entryVersionField = entry.versionField ?? getVersionFieldForRecordType(entry.type);
+		if (candidateVersionField !== entryVersionField) {
+			return false;
+		}
+
+		return isDateVersionFormat(candidate.version.trim());
+	});
+
+	if (!sibling) {
+		return;
+	}
+
+	entry.version = sibling.version.trim();
+}
+
+function propagateVersionToSiblingEntries(index: FileIndex, entry: FileIndexEntry): void {
+	const normalizedVersion = entry.version.trim();
+	if (!normalizedVersion) {
+		return;
+	}
+
+	for (const candidate of index.entries) {
+		if (candidate.contextType !== entry.contextType || candidate.guid !== entry.guid) {
+			continue;
+		}
+
+		if (entry.contextType === 'quickview') {
+			const candidateVersionField = candidate.versionField ?? getVersionFieldForRecordType(candidate.type);
+			const entryVersionField = entry.versionField ?? getVersionFieldForRecordType(entry.type);
+			if (candidateVersionField !== entryVersionField) {
+				continue;
+			}
+		}
+
+		candidate.version = normalizedVersion;
 	}
 }
 
@@ -284,7 +399,7 @@ async function loadRuntimeConfig(
 
 	const configFileName = settings.get<string>('configFileName', '.erp-dashboard-sync.json');
 	const localConfigUri = vscode.Uri.joinPath(workspaceFolder.uri, configFileName);
-	let localConfig = await readJsonFile<LocalConfig>(localConfigUri);
+	let localConfig = normalizeLocalConfig(await readJsonFile<LocalConfig>(localConfigUri));
 	const authSettings = await resolveAuthSettings(workspaceFolder, settings);
 	const authUsernameRaw = authSettings.username;
 	const authPassword = authSettings.password;
@@ -293,6 +408,10 @@ async function loadRuntimeConfig(
 	const authUsername = authUsernameRaw.trim();
 	const authDomain = authDomainRaw.trim();
 	const authWorkstation = authWorkstationRaw.trim();
+
+	if (!localConfig && !promptForDashboard) {
+		return undefined;
+	}
 
 	if (!localConfig || !localConfig.dashboardId || promptForDashboard) {
 		localConfig = await promptForWorkspaceConfig(localConfig);
@@ -316,6 +435,7 @@ async function loadRuntimeConfig(
 			'https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/utils.asmx/xmlUpdateOffline'
 		),
 		xmlUpdateOfflineRequestUrls: [],
+		verboseLogging: settings.get<boolean>('verboseLogging', false),
 		tlsAllowInsecure: settings.get<boolean>('tlsAllowInsecure', false),
 		authMode: settings.get<AuthMode>('authMode', 'ntlm'),
 		authUsername,
@@ -331,7 +451,7 @@ async function loadRuntimeConfig(
 	runtimeConfig.xmlUpdateOfflineRequestUrls = buildXmlUpdateOfflineRequestUrls(runtimeConfig.xmlUpdateOfflineSoapUrl);
 
 	if (authUsernameRaw !== authUsername || authDomainRaw !== authDomain || authWorkstationRaw !== authWorkstation) {
-		OUTPUT_CHANNEL.appendLine(
+		logOutput(
 			'[Config] Hinweis: authUsername/authDomain/authWorkstation wurden getrimmt (fuehrende/nachgestellte Leerzeichen entfernt).'
 		);
 	}
@@ -462,7 +582,7 @@ async function migrateDeprecatedSettings(settings: vscode.WorkspaceConfiguration
 	}
 
 	if (removedCount > 0) {
-		OUTPUT_CHANNEL.appendLine(
+		logOutput(
 			`[Config] Migration: ${removedCount} veraltete Setting-Werte entfernt (xmlUpdateOfflineHttpUrl/updateTransport).`
 		);
 	}
@@ -482,7 +602,7 @@ async function clearDeprecatedSettingInScope(
 		await settings.update(key, undefined, target);
 		return 1;
 	} catch (error) {
-		OUTPUT_CHANNEL.appendLine(
+		logOutput(
 			`[Config] Migration-Warnung: Konnte '${key}' in Scope ${String(target)} nicht entfernen: ${formatError(error)}`
 		);
 		return 0;
@@ -498,38 +618,39 @@ function logAuthConfigurationDiagnostics(
 	const domainInspect = settings.inspect<string>('authDomain');
 	const workstationInspect = settings.inspect<string>('authWorkstation');
 
-	OUTPUT_CHANNEL.appendLine('[Config] ERP Dashboard Sync runtime configuration loaded.');
-	OUTPUT_CHANNEL.appendLine(`[Config] Workspace folder: ${config.workspaceFolder.uri.fsPath}`);
-	OUTPUT_CHANNEL.appendLine(`[Config] authMode=${config.authMode}`);
-	OUTPUT_CHANNEL.appendLine(`[Config] authSource=${config.authSource}`);
-	OUTPUT_CHANNEL.appendLine(`[Config] tlsAllowInsecure=${config.tlsAllowInsecure ? 'yes' : 'no'}`);
-	OUTPUT_CHANNEL.appendLine(
+	logOutput('[Config] ERP Dashboard Sync runtime configuration loaded.');
+	logOutput(`[Config] Workspace folder: ${config.workspaceFolder.uri.fsPath}`);
+	logOutput(`[Config] authMode=${config.authMode}`);
+	logOutput(`[Config] authSource=${config.authSource}`);
+	logOutput(`[Config] verboseLogging=${config.verboseLogging ? 'yes' : 'no'}`);
+	logOutput(`[Config] tlsAllowInsecure=${config.tlsAllowInsecure ? 'yes' : 'no'}`);
+	logOutput(
 		`[Config] authUsername set=${config.authUsername.trim().length > 0 ? 'yes' : 'no'} (length=${config.authUsername.length})`
 	);
-	OUTPUT_CHANNEL.appendLine(
+	logOutput(
 		`[Config] authPassword set=${config.authPassword.length > 0 ? 'yes' : 'no'} (length=${config.authPassword.length})`
 	);
-	OUTPUT_CHANNEL.appendLine(
+	logOutput(
 		`[Config] authUsername scopes: global=${usernameInspect?.globalValue !== undefined ? 'set' : 'empty'}, workspace=${usernameInspect?.workspaceValue !== undefined ? 'set' : 'empty'}, workspaceFolder=${usernameInspect?.workspaceFolderValue !== undefined ? 'set' : 'empty'}`
 	);
-	OUTPUT_CHANNEL.appendLine(
+	logOutput(
 		`[Config] authPassword scopes: global=${passwordInspect?.globalValue !== undefined ? 'set' : 'empty'}, workspace=${passwordInspect?.workspaceValue !== undefined ? 'set' : 'empty'}, workspaceFolder=${passwordInspect?.workspaceFolderValue !== undefined ? 'set' : 'empty'}`
 	);
-	OUTPUT_CHANNEL.appendLine(
+	logOutput(
 		`[Config] authDomain set=${config.authDomain.length > 0 ? 'yes' : 'no'} (length=${config.authDomain.length})`
 	);
-	OUTPUT_CHANNEL.appendLine(
+	logOutput(
 		`[Config] authWorkstation set=${config.authWorkstation.length > 0 ? 'yes' : 'no'} (length=${config.authWorkstation.length})`
 	);
-	OUTPUT_CHANNEL.appendLine(
+	logOutput(
 		`[Config] authDomain scopes: global=${domainInspect?.globalValue !== undefined ? 'set' : 'empty'}, workspace=${domainInspect?.workspaceValue !== undefined ? 'set' : 'empty'}, workspaceFolder=${domainInspect?.workspaceFolderValue !== undefined ? 'set' : 'empty'}`
 	);
-	OUTPUT_CHANNEL.appendLine(
+	logOutput(
 		`[Config] authWorkstation scopes: global=${workstationInspect?.globalValue !== undefined ? 'set' : 'empty'}, workspace=${workstationInspect?.workspaceValue !== undefined ? 'set' : 'empty'}, workspaceFolder=${workstationInspect?.workspaceFolderValue !== undefined ? 'set' : 'empty'}`
 	);
 
 	if (config.authUsername.includes('\\') && config.authDomain.length > 0) {
-		OUTPUT_CHANNEL.appendLine(
+		logOutput(
 			"[Config] Warnung: Username enthaelt bereits 'domain\\user' UND authDomain ist gesetzt. Das fuehrt oft zu 401."
 		);
 	}
@@ -722,7 +843,7 @@ async function readCredentialsFromSecretStorage(
 			workstation: typeof parsed.workstation === 'string' ? parsed.workstation : ''
 		};
 	} catch (error) {
-		OUTPUT_CHANNEL.appendLine(`[Config] Ungueltiger Secret-Storage Inhalt, verwende Settings-Fallback: ${formatError(error)}`);
+		logOutput(`[Config] Ungueltiger Secret-Storage Inhalt, verwende Settings-Fallback: ${formatError(error)}`);
 		return undefined;
 	}
 }
@@ -761,14 +882,11 @@ async function fetchQuickviewRows(config: RuntimeConfig): Promise<DbRow[]> {
 		const sql = buildQuickviewSql(config.localConfig.dashboardId, includeAnpVersion);
 		const fetchUrl = new URL(config.dbFetchJsonUrl);
 		fetchUrl.searchParams.set('sql', sql);
-		OUTPUT_CHANNEL.appendLine('[DBFetch] ---- BEGIN REQUEST ----');
-		OUTPUT_CHANNEL.appendLine(`[DBFetch] Quickview: ${config.localConfig.dashboardId}`);
-		OUTPUT_CHANNEL.appendLine(`[DBFetch] Endpoint: ${config.dbFetchJsonUrl}`);
-		OUTPUT_CHANNEL.appendLine(`[DBFetch] Mode: ${includeAnpVersion ? 'with ANP_VERSION' : 'without ANP_VERSION (fallback)'}`);
-		OUTPUT_CHANNEL.appendLine(`[DBFetch] Request URL (encoded): ${fetchUrl.toString()}`);
-		OUTPUT_CHANNEL.appendLine('[DBFetch] SQL (decoded):');
-		OUTPUT_CHANNEL.appendLine(sql);
-		OUTPUT_CHANNEL.appendLine('[DBFetch] ---- END REQUEST ----');
+		logOutput(
+			`[DBFetch] Quickview request: dashboard=${config.localConfig.dashboardId}, mode=${includeAnpVersion ? 'with ANP_VERSION' : 'without ANP_VERSION (fallback)'}, endpoint=${config.dbFetchJsonUrl}, sqlLength=${sql.length}`
+		);
+		logVerbose(config, `[DBFetch] Request URL (encoded): ${fetchUrl.toString()}`);
+		logVerbose(config, `[DBFetch] SQL (decoded):\n${sql}`);
 
 		return requestText({
 			method: 'GET',
@@ -785,7 +903,7 @@ async function fetchQuickviewRows(config: RuntimeConfig): Promise<DbRow[]> {
 			throw error;
 		}
 
-		OUTPUT_CHANNEL.appendLine(
+		logOutput(
 			`[DBFetch] Anfrage mit ANP_VERSION fehlgeschlagen, fallback ohne ANP_VERSION wird versucht: ${formatError(error)}`
 		);
 		responseText = await executeFetch(false);
@@ -798,13 +916,11 @@ async function fetchFlowRows(config: RuntimeConfig): Promise<DbRow[]> {
 	const sql = buildFlowSql(config.localConfig.dashboardId);
 	const fetchUrl = new URL(config.dbFetchJsonUrl);
 	fetchUrl.searchParams.set('sql', sql);
-	OUTPUT_CHANNEL.appendLine('[DBFetch] ---- BEGIN REQUEST ----');
-	OUTPUT_CHANNEL.appendLine(`[DBFetch] Flowboard: ${config.localConfig.dashboardId}`);
-	OUTPUT_CHANNEL.appendLine(`[DBFetch] Endpoint: ${config.dbFetchJsonUrl}`);
-	OUTPUT_CHANNEL.appendLine(`[DBFetch] Request URL (encoded): ${fetchUrl.toString()}`);
-	OUTPUT_CHANNEL.appendLine('[DBFetch] SQL (decoded):');
-	OUTPUT_CHANNEL.appendLine(sql);
-	OUTPUT_CHANNEL.appendLine('[DBFetch] ---- END REQUEST ----');
+	logOutput(
+		`[DBFetch] Flow request: guid=${config.localConfig.dashboardId}, endpoint=${config.dbFetchJsonUrl}, sqlLength=${sql.length}`
+	);
+	logVerbose(config, `[DBFetch] Request URL (encoded): ${fetchUrl.toString()}`);
+	logVerbose(config, `[DBFetch] SQL (decoded):\n${sql}`);
 
 	const responseText = await requestText({
 		method: 'GET',
@@ -817,23 +933,21 @@ async function fetchFlowRows(config: RuntimeConfig): Promise<DbRow[]> {
 
 async function parseWorkspaceRows(responseText: string, config: RuntimeConfig, contextType: DashboardContextType): Promise<DbRow[]> {
 	if (!responseText || responseText.trim().length === 0) {
-		OUTPUT_CHANNEL.appendLine('[DBFetch] Leere Antwort erhalten (Body length = 0).');
+		logOutput('[DBFetch] Leere Antwort erhalten (Body length = 0).');
 		throw new Error(
 			'dbFetchJSON hat eine leere Antwort geliefert. Bitte NTLM-Logs mit HTTP-Status/Header pruefen (moeglicher Redirect oder Endpoint-/Scope-Mismatch).'
 		);
 	}
 
-	OUTPUT_CHANNEL.appendLine('[DBFetch] ---- BEGIN RAW RESPONSE ----');
-	OUTPUT_CHANNEL.appendLine(responseText);
-	OUTPUT_CHANNEL.appendLine('[DBFetch] ---- END RAW RESPONSE ----');
-
 	const rawJson = extractXmlStringValue(responseText);
-	OUTPUT_CHANNEL.appendLine('[DBFetch] ---- BEGIN EXTRACTED JSON STRING ----');
-	OUTPUT_CHANNEL.appendLine(rawJson);
-	OUTPUT_CHANNEL.appendLine('[DBFetch] ---- END EXTRACTED JSON STRING ----');
+	logOutput(
+		`[DBFetch] Response received: xmlLength=${responseText.length}, extractedJsonLength=${rawJson.length}`
+	);
+	logVerbose(config, `[DBFetch] Raw XML response:\n${responseText}`);
+	logVerbose(config, `[DBFetch] Extracted JSON string:\n${rawJson}`);
 	const parsed = await parseDbFetchJson(rawJson);
 	const list = Array.isArray(parsed) ? parsed : [parsed];
-	OUTPUT_CHANNEL.appendLine(`[DBFetch] Parsed JSON elements: ${list.length}`);
+	logOutput(`[DBFetch] Parsed JSON elements: ${list.length}`);
 
 	return list
 		.map((item) => normalizeDbRow(item, contextType))
@@ -861,16 +975,16 @@ async function parseDbFetchJson(rawJson: string): Promise<unknown> {
 	try {
 		return JSON.parse(rawJson);
 	} catch (initialError) {
-		OUTPUT_CHANNEL.appendLine(`[DBFetch] JSON.parse fehlgeschlagen: ${formatError(initialError)}`);
+		logOutput(`[DBFetch] JSON.parse fehlgeschlagen: ${formatError(initialError)}`);
 		logJsonErrorContext(rawJson, initialError, 'initial');
 
 		const sanitized = rawJson.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '');
 		if (sanitized !== rawJson) {
-			OUTPUT_CHANNEL.appendLine('[DBFetch] Hinweis: Ungueltige Steuerzeichen wurden entfernt, erneuter Parse-Versuch.');
+			logOutput('[DBFetch] Hinweis: Ungueltige Steuerzeichen wurden entfernt, erneuter Parse-Versuch.');
 			try {
 				return JSON.parse(sanitized);
 			} catch (sanitizedError) {
-				OUTPUT_CHANNEL.appendLine(`[DBFetch] Parse nach Steuerzeichen-Bereinigung fehlgeschlagen: ${formatError(sanitizedError)}`);
+				logOutput(`[DBFetch] Parse nach Steuerzeichen-Bereinigung fehlgeschlagen: ${formatError(sanitizedError)}`);
 				logJsonErrorContext(sanitized, sanitizedError, 'sanitized');
 			}
 		}
@@ -878,10 +992,10 @@ async function parseDbFetchJson(rawJson: string): Promise<unknown> {
 		try {
 			const { jsonrepair } = await import('jsonrepair');
 			const repaired = jsonrepair(sanitized);
-			OUTPUT_CHANNEL.appendLine('[DBFetch] Hinweis: JSON wurde mit jsonrepair repariert.');
+			logOutput('[DBFetch] Hinweis: JSON wurde mit jsonrepair repariert.');
 			return JSON.parse(repaired);
 		} catch (repairError) {
-			OUTPUT_CHANNEL.appendLine(`[DBFetch] JSON-Reparatur fehlgeschlagen: ${formatError(repairError)}`);
+			logOutput(`[DBFetch] JSON-Reparatur fehlgeschlagen: ${formatError(repairError)}`);
 			throw new Error(`dbFetchJSON enthaelt ungueltiges JSON und konnte nicht repariert werden. ${formatError(initialError)}`);
 		}
 	}
@@ -902,20 +1016,20 @@ function logJsonErrorContext(input: string, error: unknown, stage: string): void
 	const start = Math.max(0, position - 120);
 	const end = Math.min(input.length, position + 120);
 	const context = input.slice(start, end).replace(/\n/g, '\\n');
-	OUTPUT_CHANNEL.appendLine(`[DBFetch] JSON-Fehlerkontext (${stage}) @${position}: ${context}`);
+	logOutput(`[DBFetch] JSON-Fehlerkontext (${stage}) @${position}: ${context}`);
 
 	const segment = input.slice(0, position);
 	const qvMatches = [...segment.matchAll(/"qvquery"\s*:\s*"([^"]*)"/g)];
 	const guidMatches = [...segment.matchAll(/"GUID"\s*:\s*"([^"]*)"/g)];
 	const qvquery = qvMatches.length > 0 ? qvMatches[qvMatches.length - 1][1] : 'unknown';
 	const guid = guidMatches.length > 0 ? guidMatches[guidMatches.length - 1][1] : 'unknown';
-	OUTPUT_CHANNEL.appendLine(`[DBFetch] Vermutlich betroffener Datensatz: qvquery='${qvquery}', guid='${guid}'`);
+	logOutput(`[DBFetch] Vermutlich betroffener Datensatz: qvquery='${qvquery}', guid='${guid}'`);
 }
 
 async function materializeFiles(config: RuntimeConfig, rows: DbRow[]): Promise<FileIndex> {
 	const entries: FileIndexEntry[] = [];
 	const rootName = sanitizePathPart(config.localConfig.dashboardId);
-	const rootDir = vscode.Uri.joinPath(config.workspaceFolder.uri, config.generatedRootDir, config.localConfig.contextType, rootName);
+	const rootDir = vscode.Uri.joinPath(config.workspaceFolder.uri, config.generatedRootDir, rootName);
 	await vscode.workspace.fs.createDirectory(rootDir);
 
 	for (const row of rows) {
@@ -950,8 +1064,8 @@ async function materializeQuickviewRow(
 	}
 	fileNameParts.push(sanitizePathPart(row.guid));
 	const fileBaseName = fileNameParts.join('__');
-	const jsRelativePath = toPosixPath(path.join(config.generatedRootDir, config.localConfig.contextType, rootName, row.type.toLowerCase(), `${fileBaseName}.js`));
-	const cssRelativePath = toPosixPath(path.join(config.generatedRootDir, config.localConfig.contextType, rootName, row.type.toLowerCase(), `${fileBaseName}.css`));
+	const jsRelativePath = toPosixPath(path.join(config.generatedRootDir, rootName, row.type.toLowerCase(), `${fileBaseName}.js`));
+	const cssRelativePath = toPosixPath(path.join(config.generatedRootDir, rootName, row.type.toLowerCase(), `${fileBaseName}.css`));
 
 	await writeTextFile(vscode.Uri.joinPath(recordDir, `${fileBaseName}.js`), row.jsPageScript ?? '');
 	await writeTextFile(vscode.Uri.joinPath(recordDir, `${fileBaseName}.css`), row.cssStyle ?? '');
@@ -984,7 +1098,7 @@ async function materializeQuickviewRow(
 	});
 
 	if (row.type === 'QUERY') {
-		const sqlRelativePath = toPosixPath(path.join(config.generatedRootDir, config.localConfig.contextType, rootName, row.type.toLowerCase(), `${fileBaseName}.sql`));
+		const sqlRelativePath = toPosixPath(path.join(config.generatedRootDir, rootName, row.type.toLowerCase(), `${fileBaseName}.sql`));
 		entries.push({
 			relativePath: sqlRelativePath,
 			table: 'QVQUERY',
@@ -1010,9 +1124,9 @@ async function materializeFlowRow(
 	const flowRecordDir = vscode.Uri.joinPath(rootDir, fileBaseName);
 	await vscode.workspace.fs.createDirectory(flowRecordDir);
 
-	const xmlRelativePath = toPosixPath(path.join(config.generatedRootDir, config.localConfig.contextType, rootName, fileBaseName, `${fileBaseName}.xml`));
-	const jsRelativePath = toPosixPath(path.join(config.generatedRootDir, config.localConfig.contextType, rootName, fileBaseName, `${fileBaseName}.js`));
-	const sqlRelativePath = toPosixPath(path.join(config.generatedRootDir, config.localConfig.contextType, rootName, fileBaseName, `${fileBaseName}.sql`));
+	const xmlRelativePath = toPosixPath(path.join(config.generatedRootDir, rootName, fileBaseName, `${fileBaseName}.xml`));
+	const jsRelativePath = toPosixPath(path.join(config.generatedRootDir, rootName, fileBaseName, `${fileBaseName}.js`));
+	const sqlRelativePath = toPosixPath(path.join(config.generatedRootDir, rootName, fileBaseName, `${fileBaseName}.sql`));
 
 	await writeTextFile(vscode.Uri.joinPath(flowRecordDir, `${fileBaseName}.xml`), row.xmlDefinition ?? '');
 	await writeTextFile(vscode.Uri.joinPath(flowRecordDir, `${fileBaseName}.js`), row.javascript ?? '');
@@ -1093,32 +1207,31 @@ async function pushUpdate(config: RuntimeConfig, entry: FileIndexEntry, content:
 	const updateDataRow = buildUpdateDataRow(updateFields);
 	const updateData = toCData(updateDataRow);
 	const whereClause = `GUID='${escapeSqlString(entry.guid)}'`;
-	OUTPUT_CHANNEL.appendLine('[SaveSync] ---- BEGIN REQUEST ----');
-	OUTPUT_CHANNEL.appendLine('[SaveSync] Transport: soap12');
-	OUTPUT_CHANNEL.appendLine(`[SaveSync] Target: ${entry.table}.${entry.field}`);
+	logOutput('[SaveSync] Transport: soap12');
+	logOutput(`[SaveSync] Target: ${entry.table}.${entry.field}`);
 	if (versionField && versionValue !== undefined) {
-		OUTPUT_CHANNEL.appendLine(`[SaveSync] Version target: ${entry.table}.${versionField}=${versionValue}`);
+		logOutput(`[SaveSync] Version target: ${entry.table}.${versionField}=${versionValue}`);
 	}
 	if (flowVersionUpdate) {
-		OUTPUT_CHANNEL.appendLine(
+		logOutput(
 			`[SaveSync] Version target: ${entry.table}.MAJORVERSION=${flowVersionUpdate.major}, ${entry.table}.MINORVERSION=${flowVersionUpdate.minor}, ${entry.table}.PATCHVERSION=${flowVersionUpdate.patch}`
 		);
 	}
-	OUTPUT_CHANNEL.appendLine(`[SaveSync] Record: ${entry.recordName} (${entry.type})`);
-	OUTPUT_CHANNEL.appendLine(`[SaveSync] GUID: ${entry.guid}`);
-	OUTPUT_CHANNEL.appendLine(`[SaveSync] Content length: ${content.length}`);
+	logOutput(`[SaveSync] Record: ${entry.recordName} (${entry.type})`);
+	logOutput(`[SaveSync] GUID: ${entry.guid}`);
+	logOutput(`[SaveSync] Content length: ${content.length}`);
 
 	const soapBody = buildSoapEnvelope(entry.table, updateData, whereClause);
-	OUTPUT_CHANNEL.appendLine(`[SaveSync] Method: POST`);
-	OUTPUT_CHANNEL.appendLine(`[SaveSync] Configured endpoint: ${config.xmlUpdateOfflineSoapUrl}`);
-	OUTPUT_CHANNEL.appendLine(`[SaveSync] Headers: Content-Type=application/soap+xml; charset=utf-8`);
-	OUTPUT_CHANNEL.appendLine('[SaveSync] Body (SOAP 1.2):');
-	OUTPUT_CHANNEL.appendLine(soapBody);
+	logOutput(`[SaveSync] Method: POST`);
+	logOutput(`[SaveSync] Configured endpoint: ${config.xmlUpdateOfflineSoapUrl}`);
+	logOutput(`[SaveSync] Headers: Content-Type=application/soap+xml; charset=utf-8`);
+	logOutput(`[SaveSync] SOAP payload prepared (length=${soapBody.length})`);
+	logVerbose(config, `[SaveSync] SOAP body:\n${soapBody}`);
 
 	let lastError: unknown;
 	for (let index = 0; index < config.xmlUpdateOfflineRequestUrls.length; index += 1) {
 		const endpoint = config.xmlUpdateOfflineRequestUrls[index];
-		OUTPUT_CHANNEL.appendLine(`[SaveSync] Endpoint candidate ${index + 1}/${config.xmlUpdateOfflineRequestUrls.length}: ${endpoint}`);
+		logOutput(`[SaveSync] Endpoint candidate ${index + 1}/${config.xmlUpdateOfflineRequestUrls.length}: ${endpoint}`);
 		try {
 			await requestText({
 				method: 'POST',
@@ -1133,14 +1246,14 @@ async function pushUpdate(config: RuntimeConfig, entry: FileIndexEntry, content:
 			break;
 		} catch (error) {
 			lastError = error;
-			OUTPUT_CHANNEL.appendLine(`[SaveSync] Endpoint candidate fehlgeschlagen: ${formatError(error)}`);
+			logOutput(`[SaveSync] Endpoint candidate fehlgeschlagen: ${formatError(error)}`);
 		}
 	}
 
 	if (lastError) {
 		throw lastError;
 	}
-	OUTPUT_CHANNEL.appendLine('[SaveSync] ---- END REQUEST ----');
+	logOutput('[SaveSync] Request erfolgreich abgeschlossen.');
 	if (versionValue !== undefined) {
 		entry.version = versionValue;
 	}
@@ -1193,15 +1306,30 @@ function formatVersionStamp(value: Date): string {
 
 async function resolveQuickviewVersionValue(config: RuntimeConfig, entry: FileIndexEntry): Promise<string | undefined> {
 	const currentVersion = entry.version.trim();
+	logOutput(
+		`[Versioning][Quickview] Record='${entry.recordName}', current='${currentVersion || '<leer>'}', type=${entry.type}`
+	);
 	if (isDateVersionFormat(currentVersion)) {
-		return formatVersionStamp(new Date());
+		const autoVersion = formatVersionStamp(new Date());
+		logOutput(
+			`[Versioning][Quickview] Decision=auto-date, reason=current format YYYYMMDD, newVersion='${autoVersion}'`
+		);
+		return autoVersion;
 	}
 
 	const todayKey = getTodayKey();
 	const quickviewState = config.localConfig.quickviewVersionState;
 	if (quickviewState?.lastPromptDate === todayKey && quickviewState.pendingVersion?.trim()) {
-		return quickviewState.pendingVersion.trim();
+		const reusedVersion = quickviewState.pendingVersion.trim();
+		logOutput(
+			`[Versioning][Quickview] Decision=reuse-daily, date=${todayKey}, reusedVersion='${reusedVersion}'`
+		);
+		return reusedVersion;
 	}
+
+	logOutput(
+		`[Versioning][Quickview] Decision=prompt-manual, reason=non-date current version and no stored decision for ${todayKey}`
+	);
 
 	const manualVersion = await vscode.window.showInputBox({
 		title: 'ERP Dashboard Sync',
@@ -1212,6 +1340,7 @@ async function resolveQuickviewVersionValue(config: RuntimeConfig, entry: FileIn
 	});
 
 	if (manualVersion === undefined) {
+		logOutput('[Versioning][Quickview] Decision=cancelled-by-user');
 		return undefined;
 	}
 
@@ -1220,6 +1349,9 @@ async function resolveQuickviewVersionValue(config: RuntimeConfig, entry: FileIn
 		pendingVersion: manualVersion.trim()
 	};
 	await writeJsonFile(config.localConfigUri, config.localConfig);
+	logOutput(
+		`[Versioning][Quickview] Decision=manual-input, storedForDate=${todayKey}, newVersion='${manualVersion.trim()}'`
+	);
 
 	return manualVersion.trim();
 }
@@ -1228,31 +1360,49 @@ async function resolveFlowVersionUpdate(
 	config: RuntimeConfig,
 	entry: FileIndexEntry
 ): Promise<{ major: string; minor: string; patch: string } | undefined> {
+	logOutput(
+		`[Versioning][Flow] Record='${entry.recordName}', current='${entry.version || '<leer>'}'`
+	);
 	const currentParts = parseFlowVersion(entry.version);
 	if (!currentParts) {
+		logOutput('[Versioning][Flow] Decision=prompt-manual-version, reason=current version not parseable as MAJOR.MINOR.PATCH');
 		const manualParts = await promptFlowVersionParts(entry);
 		if (!manualParts) {
+			logOutput('[Versioning][Flow] Decision=cancelled-by-user');
 			return undefined;
 		}
+		logOutput(
+			`[Versioning][Flow] Decision=manual-version, newVersion='${manualParts.major}.${manualParts.minor}.${manualParts.patch}'`
+		);
 
 		return manualParts;
 	}
 
 	if (isFlowDateVersion(currentParts)) {
 		const now = new Date();
-		return {
+		const autoVersion = {
 			major: String(now.getFullYear()),
 			minor: String(now.getMonth() + 1).padStart(2, '0'),
 			patch: String(now.getDate()).padStart(2, '0')
 		};
+		logOutput(
+			`[Versioning][Flow] Decision=auto-date, reason=current format YYYY.MM.DD, newVersion='${autoVersion.major}.${autoVersion.minor}.${autoVersion.patch}'`
+		);
+		return autoVersion;
 	}
 
 	const todayKey = getTodayKey();
 	let bump = config.localConfig.flowVersionState?.lastPromptDate === todayKey
 		? config.localConfig.flowVersionState.pendingBump
 		: undefined;
+	if (bump) {
+		logOutput(`[Versioning][Flow] Decision=reuse-daily-bump, date=${todayKey}, bump=${bump}`);
+	}
 
 	if (!bump) {
+		logOutput(
+			`[Versioning][Flow] Decision=prompt-bump, reason=non-date version and no stored bump for ${todayKey}`
+		);
 		const decision = await vscode.window.showQuickPick(
 			[
 				{ label: 'Major +1', value: 'majorversion' as const },
@@ -1267,6 +1417,7 @@ async function resolveFlowVersionUpdate(
 		);
 
 		if (!decision) {
+			logOutput('[Versioning][Flow] Decision=cancelled-by-user');
 			return undefined;
 		}
 
@@ -1276,9 +1427,14 @@ async function resolveFlowVersionUpdate(
 			pendingBump: bump
 		};
 		await writeJsonFile(config.localConfigUri, config.localConfig);
+		logOutput(`[Versioning][Flow] Decision=manual-bump, storedForDate=${todayKey}, bump=${bump}`);
 	}
 
-	return bumpFlowVersion(currentParts, bump);
+	const bumped = bumpFlowVersion(currentParts, bump);
+	logOutput(
+		`[Versioning][Flow] Result after bump: from='${currentParts.major}.${currentParts.minor}.${currentParts.patch}' to='${bumped.major}.${bumped.minor}.${bumped.patch}'`
+	);
+	return bumped;
 }
 
 async function promptFlowVersionParts(
@@ -1469,7 +1625,7 @@ async function requestWithNtlm(options: RequestOptions): Promise<string> {
 
 	for (let index = 0; index < authCandidates.length; index += 1) {
 		const candidate = authCandidates[index];
-		OUTPUT_CHANNEL.appendLine(
+		logOutput(
 			`[NTLM] Sende ${options.method} ${url.origin}${url.pathname} (Versuch ${index + 1}/${authCandidates.length}) mit ${describeAuthIdentity(candidate.username, candidate.domain)}, workstation='${candidate.workstation || '<leer>'}'`
 		);
 
@@ -1485,7 +1641,7 @@ async function requestWithNtlm(options: RequestOptions): Promise<string> {
 			response = result.response;
 			body = result.body;
 		} catch (error) {
-			OUTPUT_CHANNEL.appendLine(
+			logOutput(
 				`[NTLM] Transportfehler bei ${options.method} ${options.url}: ${formatError(error)}`
 			);
 			throw error;
@@ -1495,12 +1651,12 @@ async function requestWithNtlm(options: RequestOptions): Promise<string> {
 			const contentType = getHeaderValue(response?.headers, 'content-type') ?? '<leer>';
 			const contentLength = getHeaderValue(response?.headers, 'content-length') ?? '<leer>';
 			const location = getHeaderValue(response?.headers, 'location') ?? '<leer>';
-			OUTPUT_CHANNEL.appendLine(
+			logOutput(
 				`[NTLM] Antwort HTTP ${response.statusCode}${response.statusMessage ? ` ${response.statusMessage}` : ''}, content-type='${contentType}', content-length='${contentLength}', location='${location}', bodyLength=${(body ?? '').length}`
 			);
 
 			if (index > 0) {
-				OUTPUT_CHANNEL.appendLine('[NTLM] Hinweis: Fallback-Identitaetsformat wurde erfolgreich verwendet.');
+				logOutput('[NTLM] Hinweis: Fallback-Identitaetsformat wurde erfolgreich verwendet.');
 			}
 			return body ?? '';
 		}
@@ -1516,13 +1672,13 @@ async function requestWithNtlm(options: RequestOptions): Promise<string> {
 			candidate.domain,
 			candidate.workstation
 		);
-		OUTPUT_CHANNEL.appendLine(`[NTLM] ${diagnostic}`);
+		logOutput(`[NTLM] ${diagnostic}`);
 
 		lastError = new Error(`NTLM Request fehlgeschlagen: ${diagnostic}`);
 
 		const hasMoreCandidates = index < authCandidates.length - 1;
 		if (statusCode === 401 && hasMoreCandidates) {
-			OUTPUT_CHANNEL.appendLine('[NTLM] HTTP 401 - versuche alternatives Username/Domain-Format.');
+			logOutput('[NTLM] HTTP 401 - versuche alternatives Username/Domain-Format.');
 			continue;
 		}
 
@@ -1845,6 +2001,66 @@ function sanitizePathPart(value: string): string {
 
 function toPosixPath(input: string): string {
 	return input.split(path.sep).join('/');
+}
+
+type IndexPathMatchKind = 'exact' | 'case-insensitive' | 'legacy-layout';
+
+function findIndexEntryByRelativePath(
+	index: FileIndex,
+	relativePath: string,
+	contextType: DashboardContextType,
+	generatedRootDir: string
+): { entry?: FileIndexEntry; matchKind?: IndexPathMatchKind } {
+	const exact = index.entries.find((item) => item.relativePath === relativePath);
+	if (exact) {
+		return { entry: exact, matchKind: 'exact' };
+	}
+
+	if (process.platform === 'win32') {
+		const relativePathLower = relativePath.toLowerCase();
+		const caseInsensitive = index.entries.find((item) => item.relativePath.toLowerCase() === relativePathLower);
+		if (caseInsensitive) {
+			return { entry: caseInsensitive, matchKind: 'case-insensitive' };
+		}
+	}
+
+	const normalizedRelativePath = normalizeManagedRelativePath(relativePath, generatedRootDir, contextType);
+	for (const candidate of index.entries) {
+		const normalizedCandidatePath = normalizeManagedRelativePath(candidate.relativePath, generatedRootDir, contextType);
+		const isMatch = process.platform === 'win32'
+			? normalizedCandidatePath.toLowerCase() === normalizedRelativePath.toLowerCase()
+			: normalizedCandidatePath === normalizedRelativePath;
+		if (isMatch) {
+			return { entry: candidate, matchKind: 'legacy-layout' };
+		}
+	}
+
+	return {};
+}
+
+function normalizeManagedRelativePath(
+	relativePath: string,
+	generatedRootDir: string,
+	contextType: DashboardContextType
+): string {
+	const normalizedPath = toPosixPath(relativePath).replace(/^\.\//, '');
+	const normalizedRoot = toPosixPath(generatedRootDir).replace(/^\.\//, '').replace(/\/+$/, '');
+	if (!normalizedRoot) {
+		return normalizedPath;
+	}
+
+	const rootPrefix = `${normalizedRoot}/`;
+	if (!normalizedPath.startsWith(rootPrefix)) {
+		return normalizedPath;
+	}
+
+	const rest = normalizedPath.slice(rootPrefix.length);
+	const contextPrefix = `${contextType}/`;
+	if (rest.startsWith(contextPrefix)) {
+		return `${rootPrefix}${rest.slice(contextPrefix.length)}`;
+	}
+
+	return normalizedPath;
 }
 
 function escapeSqlString(value: string): string {
