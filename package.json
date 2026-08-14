@@ -2,7 +2,7 @@
   "name": "erp-dashboard-sync",
   "displayName": "ERP Dashboard Sync",
   "description": "Sync JS/CSS files between VS Code workspace and APplus ERP dashboard",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "vscode": "^1.118.0"
@@ -97,11 +97,6 @@
           "type": "string",
           "default": "",
           "description": "Domain for NTLM authentication (fallback, if no Secret Storage credentials exist)."
-        },
-        "erpDashboardSync.authWorkstation": {
-          "type": "string",
-          "default": "",
-          "description": "Workstation for NTLM authentication (fallback, if no Secret Storage credentials exist)."
         },
         "erpDashboardSync.autoSyncOnSave": {
           "type": "boolean",

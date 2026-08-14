@@ -38,6 +38,12 @@ VS Code extension to synchronize APplus Quickview and Flowboard sources with loc
    - Command Palette: `ERP Dashboard Sync: Set Credentials (Secret Storage)`
 4. Erstinitialisierung starten:
    - Command Palette: `ERP Dashboard Sync: Initialize Workspace`
+  - Die Extension setzt bei Bedarf fehlende Workspace-Settings automatisch:
+    - `erpDashboardSync.dbFetchJsonUrl`
+    - `erpDashboardSync.xmlUpdateOfflineSoapUrl`
+    - `erpDashboardSync.authMode = ntlm`
+    - `erpDashboardSync.tlsAllowInsecure = true`
+  - Wenn `authMode = ntlm` und Username/Passwort fehlen, werden Credentials zuerst abgefragt.
 5. Im Dialog den Typ waehlen:
    - `Quickview`
    - `Flow`
@@ -61,7 +67,8 @@ Hinweis:
 	- Verwendet bestehende Konfiguration und laedt alle generierten Dateien neu.
 	- Sinnvoll als manueller Refresh bei Aenderungen direkt in ERP.
 - `ERP Dashboard Sync: Set Credentials (Secret Storage)`
-  - Speichert NTLM username/password/domain/workstation sicher im VS Code Secret Storage.
+  - Speichert NTLM username/password/domain sicher im VS Code Secret Storage.
+  - Optional als Workspace-Credentials oder global fuer alle Workspaces.
 - `ERP Dashboard Sync: Clear Credentials (Secret Storage)`
   - Entfernt gespeicherte Credentials aus VS Code Secret Storage.
 - `ERP Dashboard Sync: Reset Version Prompt State`
@@ -143,12 +150,25 @@ For environments where Postman requires NTLM, configure:
 - `erpDashboardSync.authMode = ntlm`
 - Preferred: run `ERP Dashboard Sync: Set Credentials (Secret Storage)`
 - Fallback: `erpDashboardSync.authUsername` / `erpDashboardSync.authPassword`
-- optional domain/workstation fields
+- optional domain field
 
 Credential precedence:
 
 1. Secret Storage credentials (recommended)
-2. Plain settings (`authUsername` / `authPassword` / `authDomain` / `authWorkstation`) as fallback
+2. Plain settings (`authUsername` / `authPassword` / `authDomain`) as fallback
+
+### Pflichtfelder fuer den Betrieb
+
+- Immer erforderlich:
+  - `contextType` und Identifier in `.erp-dashboard-sync.json` (wird durch `Initialize Workspace` abgefragt/angelegt)
+- Fuer Endpoints:
+  - `dbFetchJsonUrl` und `xmlUpdateOfflineSoapUrl` sind technisch erforderlich, werden aber durch Default/Onboarding automatisch gesetzt.
+- Fuer Authentifizierung:
+  - `authMode` ist erforderlich (Default: `ntlm`).
+  - Bei `authMode = ntlm` sind `username` und `password` erforderlich (Secret Storage oder Fallback-Settings).
+  - `authDomain` ist optional (wird bei Bedarf aus Credentials uebernommen).
+- TLS:
+  - `tlsAllowInsecure` ist optional (Default/Onboarding setzt auf `true` fuer interne Umgebungen mit Self-Signed Zertifikaten). In sicheren PKI-Umgebungen kann es `false` bleiben.
 
 ## Development
 

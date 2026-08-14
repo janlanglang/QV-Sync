@@ -1,6 +1,5 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import * as os from 'os';
 import { XMLParser } from 'fast-xml-parser';
 import * as httpntlm from 'httpntlm';
 
@@ -40,7 +39,6 @@ interface RuntimeConfig {
 	authUsername: string;
 	authPassword: string;
 	authDomain: string;
-	authWorkstation: string;
 	authSource: 'settings' | 'secretStorage';
 	autoSyncOnSave: boolean;
 	configFileName: string;
@@ -52,7 +50,6 @@ interface StoredCredentials {
 	username: string;
 	password: string;
 	domain: string;
-	workstation: string;
 }
 
 interface DbRow {
@@ -100,6 +97,13 @@ const OUTPUT_CHANNEL = vscode.window.createOutputChannel('ERP Dashboard Sync');
 const XML_PARSER = new XMLParser({ ignoreAttributes: false, trimValues: false });
 const DEPRECATED_SETTING_KEYS = ['xmlUpdateOfflineHttpUrl', 'updateTransport'] as const;
 const SECRET_STORAGE_PREFIX = 'erp-dashboard-sync';
+type CredentialScope = 'workspace' | 'global';
+const ONBOARDING_DEFAULTS = {
+	dbFetchJsonUrl: 'https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/customutils.asmx/dbFetchJSON',
+	xmlUpdateOfflineSoapUrl: 'https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/utils.asmx',
+	authMode: 'ntlm' as AuthMode,
+	tlsAllowInsecure: true
+};
 let deprecatedSettingsMigrationCompleted = false;
 let extensionContext: vscode.ExtensionContext | undefined;
 
@@ -169,6 +173,12 @@ async function initializeWorkspace(promptForDashboard: boolean): Promise<void> {
 		return;
 	}
 
+	await ensureWorkspaceBootstrapSettings(workspaceFolder);
+	const canContinue = await ensureCredentialsForInitialization(workspaceFolder);
+	if (!canContinue) {
+		return;
+	}
+
 	await vscode.window.withProgress(
 		{
 			location: vscode.ProgressLocation.Notification,
@@ -204,6 +214,96 @@ async function initializeWorkspace(promptForDashboard: boolean): Promise<void> {
 			);
 		}
 	);
+}
+
+async function ensureWorkspaceBootstrapSettings(workspaceFolder: vscode.WorkspaceFolder): Promise<void> {
+	const settings = vscode.workspace.getConfiguration('erpDashboardSync', workspaceFolder.uri);
+	let updatedCount = 0;
+
+	updatedCount += await applySettingIfMissing(
+		settings,
+		'dbFetchJsonUrl',
+		ONBOARDING_DEFAULTS.dbFetchJsonUrl,
+		workspaceFolder
+	);
+	updatedCount += await applySettingIfMissing(
+		settings,
+		'xmlUpdateOfflineSoapUrl',
+		ONBOARDING_DEFAULTS.xmlUpdateOfflineSoapUrl,
+		workspaceFolder
+	);
+	updatedCount += await applySettingIfMissing(settings, 'authMode', ONBOARDING_DEFAULTS.authMode, workspaceFolder);
+	updatedCount += await applySettingIfMissing(
+		settings,
+		'tlsAllowInsecure',
+		ONBOARDING_DEFAULTS.tlsAllowInsecure,
+		workspaceFolder
+	);
+
+	if (updatedCount > 0) {
+		logOutput(
+			`[Onboarding] ${updatedCount} fehlende Workspace-Settings wurden mit Startwerten gesetzt (dbFetchJsonUrl/xmlUpdateOfflineSoapUrl/authMode/tlsAllowInsecure).`
+		);
+	}
+}
+
+async function applySettingIfMissing<T>(
+	settings: vscode.WorkspaceConfiguration,
+	key: string,
+	value: T,
+	workspaceFolder: vscode.WorkspaceFolder
+): Promise<number> {
+	const inspect = settings.inspect<T>(key);
+	const hasWorkspaceValue = inspect?.workspaceValue !== undefined || inspect?.workspaceFolderValue !== undefined;
+	if (hasWorkspaceValue) {
+		return 0;
+	}
+
+	await settings.update(key, value, vscode.ConfigurationTarget.Workspace);
+	logOutput(
+		`[Onboarding] Workspace-Setting gesetzt: erpDashboardSync.${key}=${typeof value === 'string' ? `'${value}'` : String(value)} (${workspaceFolder.uri.fsPath})`
+	);
+	return 1;
+}
+
+async function ensureCredentialsForInitialization(workspaceFolder: vscode.WorkspaceFolder): Promise<boolean> {
+	const settings = vscode.workspace.getConfiguration('erpDashboardSync', workspaceFolder.uri);
+	const authMode = settings.get<AuthMode>('authMode', 'ntlm');
+	if (authMode !== 'ntlm') {
+		return true;
+	}
+
+	const authSettings = await resolveAuthSettings(workspaceFolder, settings);
+	const hasUsername = authSettings.username.trim().length > 0;
+	const hasPassword = authSettings.password.length > 0;
+	if (hasUsername && hasPassword) {
+		return true;
+	}
+
+	const answer = await vscode.window.showWarningMessage(
+		'ERP Dashboard Sync: Fuer NTLM fehlen Username/Passwort. Soll ich die Credentials jetzt abfragen und im Secret Storage speichern?',
+		{ modal: true },
+		'Credentials setzen',
+		'Abbrechen'
+	);
+
+	if (answer !== 'Credentials setzen') {
+		vscode.window.showInformationMessage('ERP Dashboard Sync: Initialisierung abgebrochen (fehlende Credentials).');
+		return false;
+	}
+
+	await setCredentialsInSecretStorage();
+	const refreshedAuthSettings = await resolveAuthSettings(workspaceFolder, settings);
+	const hasCredentialsAfterPrompt =
+		refreshedAuthSettings.username.trim().length > 0 && refreshedAuthSettings.password.length > 0;
+	if (!hasCredentialsAfterPrompt) {
+		vscode.window.showWarningMessage(
+			'ERP Dashboard Sync: Initialisierung abgebrochen, weil weiterhin keine vollstaendigen NTLM-Credentials vorhanden sind.'
+		);
+		return false;
+	}
+
+	return true;
 }
 
 async function triggerStartupReloadIfConfigured(): Promise<void> {
@@ -404,10 +504,8 @@ async function loadRuntimeConfig(
 	const authUsernameRaw = authSettings.username;
 	const authPassword = authSettings.password;
 	const authDomainRaw = authSettings.domain;
-	const authWorkstationRaw = authSettings.workstation;
 	const authUsername = authUsernameRaw.trim();
 	const authDomain = authDomainRaw.trim();
-	const authWorkstation = authWorkstationRaw.trim();
 
 	if (!localConfig && !promptForDashboard) {
 		return undefined;
@@ -441,7 +539,6 @@ async function loadRuntimeConfig(
 		authUsername,
 		authPassword,
 		authDomain,
-		authWorkstation,
 		authSource: authSettings.source,
 		autoSyncOnSave: settings.get<boolean>('autoSyncOnSave', true),
 		configFileName,
@@ -450,9 +547,9 @@ async function loadRuntimeConfig(
 	};
 	runtimeConfig.xmlUpdateOfflineRequestUrls = buildXmlUpdateOfflineRequestUrls(runtimeConfig.xmlUpdateOfflineSoapUrl);
 
-	if (authUsernameRaw !== authUsername || authDomainRaw !== authDomain || authWorkstationRaw !== authWorkstation) {
+	if (authUsernameRaw !== authUsername || authDomainRaw !== authDomain) {
 		logOutput(
-			'[Config] Hinweis: authUsername/authDomain/authWorkstation wurden getrimmt (fuehrende/nachgestellte Leerzeichen entfernt).'
+			'[Config] Hinweis: authUsername/authDomain wurden getrimmt (fuehrende/nachgestellte Leerzeichen entfernt).'
 		);
 	}
 
@@ -616,7 +713,6 @@ function logAuthConfigurationDiagnostics(
 	const usernameInspect = settings.inspect<string>('authUsername');
 	const passwordInspect = settings.inspect<string>('authPassword');
 	const domainInspect = settings.inspect<string>('authDomain');
-	const workstationInspect = settings.inspect<string>('authWorkstation');
 
 	logOutput('[Config] ERP Dashboard Sync runtime configuration loaded.');
 	logOutput(`[Config] Workspace folder: ${config.workspaceFolder.uri.fsPath}`);
@@ -640,13 +736,7 @@ function logAuthConfigurationDiagnostics(
 		`[Config] authDomain set=${config.authDomain.length > 0 ? 'yes' : 'no'} (length=${config.authDomain.length})`
 	);
 	logOutput(
-		`[Config] authWorkstation set=${config.authWorkstation.length > 0 ? 'yes' : 'no'} (length=${config.authWorkstation.length})`
-	);
-	logOutput(
 		`[Config] authDomain scopes: global=${domainInspect?.globalValue !== undefined ? 'set' : 'empty'}, workspace=${domainInspect?.workspaceValue !== undefined ? 'set' : 'empty'}, workspaceFolder=${domainInspect?.workspaceFolderValue !== undefined ? 'set' : 'empty'}`
-	);
-	logOutput(
-		`[Config] authWorkstation scopes: global=${workstationInspect?.globalValue !== undefined ? 'set' : 'empty'}, workspace=${workstationInspect?.workspaceValue !== undefined ? 'set' : 'empty'}, workspaceFolder=${workstationInspect?.workspaceFolderValue !== undefined ? 'set' : 'empty'}`
 	);
 
 	if (config.authUsername.includes('\\') && config.authDomain.length > 0) {
@@ -660,10 +750,18 @@ async function resolveAuthSettings(
 	workspaceFolder: vscode.WorkspaceFolder,
 	settings: vscode.WorkspaceConfiguration
 ): Promise<StoredCredentials & { source: 'settings' | 'secretStorage' }> {
-	const stored = await readCredentialsFromSecretStorage(workspaceFolder);
+	const stored = await readCredentialsFromSecretStorage(workspaceFolder, 'workspace');
 	if (stored) {
 		return {
 			...stored,
+			source: 'secretStorage'
+		};
+	}
+
+	const storedGlobal = await readCredentialsFromSecretStorage(workspaceFolder, 'global');
+	if (storedGlobal) {
+		return {
+			...storedGlobal,
 			source: 'secretStorage'
 		};
 	}
@@ -672,7 +770,6 @@ async function resolveAuthSettings(
 		username: settings.get<string>('authUsername', ''),
 		password: settings.get<string>('authPassword', ''),
 		domain: settings.get<string>('authDomain', ''),
-		workstation: settings.get<string>('authWorkstation', ''),
 		source: 'settings'
 	};
 }
@@ -732,25 +829,32 @@ async function setCredentialsInSecretStorage(): Promise<void> {
 		return;
 	}
 
-	const workstation = await vscode.window.showInputBox({
-		title: 'ERP Dashboard Sync Credentials',
-		prompt: 'NTLM Workstation (optional)',
-		value: current.workstation,
-		ignoreFocusOut: true
-	});
+	const scopeChoice = await vscode.window.showQuickPick(
+		[
+			{ label: 'Nur in diesem Workspace speichern', value: 'workspace' as const },
+			{ label: 'Global fuer alle Workspaces speichern', value: 'global' as const }
+		],
+		{
+			title: 'ERP Dashboard Sync Credentials',
+			placeHolder: 'Wo sollen die Credentials gespeichert werden?'
+		}
+	);
 
-	if (workstation === undefined) {
+	if (!scopeChoice) {
 		return;
 	}
 
 	await writeCredentialsToSecretStorage(workspaceFolder, {
 		username: username.trim(),
 		password: passwordInput.length > 0 ? passwordInput : current.password,
-		domain: domain.trim(),
-		workstation: workstation.trim()
-	});
+		domain: domain.trim()
+	}, scopeChoice.value);
 
-	vscode.window.showInformationMessage('ERP Dashboard Sync: Credentials sicher im Secret Storage gespeichert.');
+	vscode.window.showInformationMessage(
+		scopeChoice.value === 'global'
+			? 'ERP Dashboard Sync: Credentials global im Secret Storage gespeichert.'
+			: 'ERP Dashboard Sync: Credentials fuer diesen Workspace im Secret Storage gespeichert.'
+	);
 }
 
 async function clearCredentialsInSecretStorage(): Promise<void> {
@@ -765,6 +869,22 @@ async function clearCredentialsInSecretStorage(): Promise<void> {
 		return;
 	}
 
+	const scopeChoice = await vscode.window.showQuickPick(
+		[
+			{ label: 'Credentials fuer diesen Workspace loeschen', value: 'workspace' as const },
+			{ label: 'Globale Credentials loeschen', value: 'global' as const },
+			{ label: 'Beides loeschen', value: 'both' as const }
+		],
+		{
+			title: 'ERP Dashboard Sync Credentials',
+			placeHolder: 'Welche gespeicherten Credentials sollen geloescht werden?'
+		}
+	);
+
+	if (!scopeChoice) {
+		return;
+	}
+
 	const answer = await vscode.window.showWarningMessage(
 		'ERP Dashboard Sync: Gespeicherte Credentials aus dem Secret Storage loeschen?',
 		{ modal: true },
@@ -775,8 +895,15 @@ async function clearCredentialsInSecretStorage(): Promise<void> {
 		return;
 	}
 
-	await deleteCredentialsFromSecretStorage(workspaceFolder);
-	vscode.window.showInformationMessage('ERP Dashboard Sync: Credentials aus Secret Storage geloescht.');
+	if (scopeChoice.value === 'workspace' || scopeChoice.value === 'both') {
+		await deleteCredentialsFromSecretStorage(workspaceFolder, 'workspace');
+	}
+
+	if (scopeChoice.value === 'global' || scopeChoice.value === 'both') {
+		await deleteCredentialsFromSecretStorage(workspaceFolder, 'global');
+	}
+
+	vscode.window.showInformationMessage('ERP Dashboard Sync: Gewaehlte Credentials wurden aus Secret Storage geloescht.');
 }
 
 async function resetVersionPromptState(): Promise<void> {
@@ -817,18 +944,23 @@ async function resetVersionPromptState(): Promise<void> {
 	vscode.window.showInformationMessage('ERP Dashboard Sync: Versions-Prompt-States wurden zurueckgesetzt.');
 }
 
-function getSecretStorageKey(workspaceFolder: vscode.WorkspaceFolder): string {
+function getSecretStorageKey(workspaceFolder: vscode.WorkspaceFolder, scope: CredentialScope): string {
+	if (scope === 'global') {
+		return `${SECRET_STORAGE_PREFIX}:credentials:global`;
+	}
+
 	return `${SECRET_STORAGE_PREFIX}:credentials:${workspaceFolder.uri.toString()}`;
 }
 
 async function readCredentialsFromSecretStorage(
-	workspaceFolder: vscode.WorkspaceFolder
+	workspaceFolder: vscode.WorkspaceFolder,
+	scope: CredentialScope
 ): Promise<StoredCredentials | undefined> {
 	if (!extensionContext) {
 		return undefined;
 	}
 
-	const key = getSecretStorageKey(workspaceFolder);
+	const key = getSecretStorageKey(workspaceFolder, scope);
 	const raw = await extensionContext.secrets.get(key);
 	if (!raw) {
 		return undefined;
@@ -839,8 +971,7 @@ async function readCredentialsFromSecretStorage(
 		return {
 			username: typeof parsed.username === 'string' ? parsed.username : '',
 			password: typeof parsed.password === 'string' ? parsed.password : '',
-			domain: typeof parsed.domain === 'string' ? parsed.domain : '',
-			workstation: typeof parsed.workstation === 'string' ? parsed.workstation : ''
+			domain: typeof parsed.domain === 'string' ? parsed.domain : ''
 		};
 	} catch (error) {
 		logOutput(`[Config] Ungueltiger Secret-Storage Inhalt, verwende Settings-Fallback: ${formatError(error)}`);
@@ -850,22 +981,26 @@ async function readCredentialsFromSecretStorage(
 
 async function writeCredentialsToSecretStorage(
 	workspaceFolder: vscode.WorkspaceFolder,
-	credentials: StoredCredentials
+	credentials: StoredCredentials,
+	scope: CredentialScope
 ): Promise<void> {
 	if (!extensionContext) {
 		throw new Error('Secret Storage ist nicht verfuegbar.');
 	}
 
-	const key = getSecretStorageKey(workspaceFolder);
+	const key = getSecretStorageKey(workspaceFolder, scope);
 	await extensionContext.secrets.store(key, JSON.stringify(credentials));
 }
 
-async function deleteCredentialsFromSecretStorage(workspaceFolder: vscode.WorkspaceFolder): Promise<void> {
+async function deleteCredentialsFromSecretStorage(
+	workspaceFolder: vscode.WorkspaceFolder,
+	scope: CredentialScope
+): Promise<void> {
 	if (!extensionContext) {
 		return;
 	}
 
-	const key = getSecretStorageKey(workspaceFolder);
+	const key = getSecretStorageKey(workspaceFolder, scope);
 	await extensionContext.secrets.delete(key);
 }
 
@@ -1626,7 +1761,7 @@ async function requestWithNtlm(options: RequestOptions): Promise<string> {
 	for (let index = 0; index < authCandidates.length; index += 1) {
 		const candidate = authCandidates[index];
 		logOutput(
-			`[NTLM] Sende ${options.method} ${url.origin}${url.pathname} (Versuch ${index + 1}/${authCandidates.length}) mit ${describeAuthIdentity(candidate.username, candidate.domain)}, workstation='${candidate.workstation || '<leer>'}'`
+			`[NTLM] Sende ${options.method} ${url.origin}${url.pathname} (Versuch ${index + 1}/${authCandidates.length}) mit ${describeAuthIdentity(candidate.username, candidate.domain)}`
 		);
 
 		let response: {
@@ -1637,7 +1772,7 @@ async function requestWithNtlm(options: RequestOptions): Promise<string> {
 		let body = '';
 
 		try {
-			const result = await executeNtlmRequest(options, candidate.username, candidate.domain, candidate.workstation);
+			const result = await executeNtlmRequest(options, candidate.username, candidate.domain);
 			response = result.response;
 			body = result.body;
 		} catch (error) {
@@ -1669,8 +1804,7 @@ async function requestWithNtlm(options: RequestOptions): Promise<string> {
 			response?.headers,
 			body,
 			candidate.username,
-			candidate.domain,
-			candidate.workstation
+			candidate.domain
 		);
 		logOutput(`[NTLM] ${diagnostic}`);
 
@@ -1688,17 +1822,15 @@ async function requestWithNtlm(options: RequestOptions): Promise<string> {
 	throw lastError ?? new Error('NTLM Request fehlgeschlagen.');
 }
 
-function buildNtlmAuthCandidates(config: RuntimeConfig): Array<{ username: string; domain: string; workstation: string }> {
-	const candidates: Array<{ username: string; domain: string; workstation: string }> = [];
-	const workstationCandidates = buildNtlmWorkstationCandidates(config.authWorkstation);
+function buildNtlmAuthCandidates(config: RuntimeConfig): Array<{ username: string; domain: string }> {
+	const candidates: Array<{ username: string; domain: string }> = [];
 	const addCandidate = (username: string, domain: string): void => {
-		for (const workstation of workstationCandidates) {
-			const key = `${username}|||${domain}|||${workstation}`;
-			if (candidates.some((item) => `${item.username}|||${item.domain}|||${item.workstation}` === key)) {
-				continue;
-			}
-			candidates.push({ username, domain, workstation });
+		const key = `${username}|||${domain}`;
+		if (candidates.some((item) => `${item.username}|||${item.domain}` === key)) {
+			return;
 		}
+
+		candidates.push({ username, domain });
 	};
 
 	const username = config.authUsername;
@@ -1721,33 +1853,10 @@ function buildNtlmAuthCandidates(config: RuntimeConfig): Array<{ username: strin
 	return candidates;
 }
 
-function buildNtlmWorkstationCandidates(configuredWorkstation: string): string[] {
-	const values: string[] = [];
-	const add = (value: string): void => {
-		if (!values.includes(value)) {
-			values.push(value);
-		}
-	};
-
-	add(configuredWorkstation);
-	if (configuredWorkstation.length > 0) {
-		add('');
-	}
-
-	const localHost = os.hostname().trim();
-	if (localHost.length > 0) {
-		add(localHost);
-		add(localHost.toUpperCase());
-	}
-
-	return values;
-}
-
 function executeNtlmRequest(
 	options: RequestOptions,
 	username: string,
-	domain: string,
-	workstation: string
+	domain: string
 ): Promise<{
 	response: { statusCode?: number; statusMessage?: string; headers?: Record<string, string | string[] | undefined> };
 	body: string;
@@ -1758,7 +1867,6 @@ function executeNtlmRequest(
 			username,
 			password: options.config.authPassword,
 			domain,
-			workstation,
 			rejectUnauthorized: !options.config.tlsAllowInsecure,
 			headers: options.headers,
 			body: options.body
@@ -1804,8 +1912,7 @@ function buildNtlmDiagnostic(
 	headers: Record<string, string | string[] | undefined> | undefined,
 	body: string,
 	attemptedUsername?: string,
-	attemptedDomain?: string,
-	attemptedWorkstation?: string
+	attemptedDomain?: string
 ): string {
 	const bodyPreview = (body ?? '').replace(/\s+/g, ' ').trim().slice(0, 300);
 	const challengeHeader = getHeaderValue(headers, 'www-authenticate');
@@ -1814,9 +1921,7 @@ function buildNtlmDiagnostic(
 		attemptedUsername ?? config.authUsername,
 		attemptedDomain ?? config.authDomain
 	);
-	const attemptedWorkstationValue = attemptedWorkstation ?? config.authWorkstation;
-	const attemptedWorkstationDisplay = attemptedWorkstationValue.length > 0 ? attemptedWorkstationValue : '<leer>';
-	const scopeInfo = `authMode=${config.authMode}, passwordSet=${config.authPassword.length > 0 ? 'yes' : 'no'}, workstation='${config.authWorkstation}', tlsAllowInsecure=${config.tlsAllowInsecure ? 'yes' : 'no'}, attemptedIdentity=${attemptedIdentityInfo}, attemptedWorkstation='${attemptedWorkstationDisplay}', configuredIdentity=${configuredIdentityInfo}`;
+	const scopeInfo = `authMode=${config.authMode}, passwordSet=${config.authPassword.length > 0 ? 'yes' : 'no'}, tlsAllowInsecure=${config.tlsAllowInsecure ? 'yes' : 'no'}, attemptedIdentity=${attemptedIdentityInfo}, configuredIdentity=${configuredIdentityInfo}`;
 	const statusText = statusMessage ? ` ${statusMessage}` : '';
 	const challengeText = challengeHeader ? `WWW-Authenticate='${challengeHeader}'` : 'WWW-Authenticate=<leer>';
 
