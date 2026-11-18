@@ -69,6 +69,11 @@ interface DbRow {
 	statement: string;
 	jsPageScript: string;
 	cssStyle: string;
+	options?: string;
+	dashboardQueryGuid?: string;
+	paramString?: string;
+	jsChartScript?: string;
+	chartOptions?: string;
 	version: string;
 	type: RecordType;
 }
@@ -76,12 +81,13 @@ interface DbRow {
 interface FileIndexEntry {
 	relativePath: string;
 	contentHash?: string;
-	table: 'QVQUERY' | 'QVDASHBOARD' | 'FLOWBOARD';
-	field: 'JSPAGESCRIPT' | 'CSSSTYLE' | 'STATEMENT' | 'XMLDEFINITION' | 'JAVASCRIPT' | 'SQLSTATEMENT';
+	table: 'QVQUERY' | 'QVDASHBOARD' | 'QVDASHBOARDQUERY' | 'FLOWBOARD';
+	field: 'JSPAGESCRIPT' | 'CSSSTYLE' | 'STATEMENT' | 'XMLDEFINITION' | 'JAVASCRIPT' | 'SQLSTATEMENT'
+		| 'PARAMSTRING' | 'JSCHARTSCRIPT' | 'CHARTOPTIONS' | 'OPTIONS';
 	versionField?: 'VERSION' | 'ANP_VERSION';
 	guid: string;
 	recordName: string;
-	type: RecordType;
+	type: RecordType | 'DASHBOARDQUERY';
 	version: string;
 	contextType: DashboardContextType;
 }
@@ -101,6 +107,8 @@ interface RequestOptions {
 	config: RuntimeConfig;
 }
 
+class PartialSyncError extends Error {}
+
 const OUTPUT_CHANNEL = vscode.window.createOutputChannel('ERP Dashboard Sync');
 const XML_PARSER = new XMLParser({ ignoreAttributes: false, trimValues: false });
 const DEPRECATED_SETTING_KEYS = ['xmlUpdateOfflineHttpUrl', 'updateTransport'] as const;
@@ -117,6 +125,7 @@ let extensionContext: vscode.ExtensionContext | undefined;
 let syncQueue: Promise<void> = Promise.resolve();
 const pendingFileChanges = new Map<string, ReturnType<typeof setTimeout>>();
 const synchronizedContentHashes = new Map<string, string>();
+const pendingDashboardVersionUpdates = new Set<string>();
 
 function enqueueSyncOperation(operation: () => Promise<void>): Promise<void> {
 	const result = syncQueue.then(operation);
@@ -204,7 +213,7 @@ export function activate(context: vscode.ExtensionContext): void {
 		})
 	);
 
-	const watcher = vscode.workspace.createFileSystemWatcher('**/*.{js,css,sql,xml}');
+	const watcher = vscode.workspace.createFileSystemWatcher('**/*.{js,css,sql,xml,txt}');
 	context.subscriptions.push(
 		watcher,
 		watcher.onDidChange((uri) => scheduleFileSync(uri, 'filesystem')),
@@ -460,7 +469,8 @@ async function syncFile(uri: vscode.Uri, source: 'save' | 'filesystem'): Promise
 		throw error;
 	}
 	const contentHash = hashContent(content);
-	if ((synchronizedContentHashes.get(uri.toString()) ?? entry.contentHash) === contentHash) {
+	if (!pendingDashboardVersionUpdates.has(uri.toString())
+		&& (synchronizedContentHashes.get(uri.toString()) ?? entry.contentHash) === contentHash) {
 		logOutput(`[SaveSync] Skip: Inhalt unveraendert (${relativePath}, Quelle=${source}).`);
 		return;
 	}
@@ -475,12 +485,15 @@ async function syncFile(uri: vscode.Uri, source: 'save' | 'filesystem'): Promise
 	}
 
 	try {
-		const pushed = await pushUpdate(config, entry, content);
+		const pushed = entry.table === 'QVDASHBOARDQUERY'
+			? await pushDashboardQueryUpdate(config, index, entry, content)
+			: await pushUpdate(config, entry, content);
 		if (!pushed) {
 			vscode.window.setStatusBarMessage('ERP Sync: Update abgebrochen', 2500);
 			return;
 		}
 		synchronizedContentHashes.set(uri.toString(), contentHash);
+		pendingDashboardVersionUpdates.delete(uri.toString());
 
 		try {
 			entry.contentHash = contentHash;
@@ -495,9 +508,15 @@ async function syncFile(uri: vscode.Uri, source: 'save' | 'filesystem'): Promise
 
 		vscode.window.setStatusBarMessage(`ERP Sync: ${entry.recordName} (${entry.field}) aktualisiert`, 2500);
 	} catch (error) {
+		if (error instanceof PartialSyncError) {
+			pendingDashboardVersionUpdates.add(uri.toString());
+			synchronizedContentHashes.delete(uri.toString());
+		}
 		logOutput(`Save-Sync fehlgeschlagen fuer ${relativePath}: ${formatError(error)}`);
 		vscode.window.showErrorMessage(
-			`ERP Dashboard Sync: Update fehlgeschlagen fuer ${entry.recordName} (${entry.field}). Details im Output-Channel.`
+			error instanceof PartialSyncError
+				? error.message
+				: `ERP Dashboard Sync: Update fehlgeschlagen fuer ${entry.recordName} (${entry.field}). Details im Output-Channel.`
 		);
 	}
 }
@@ -1281,6 +1300,7 @@ async function materializeQuickviewRow(
 	await writeGeneratedFile(vscode.Uri.joinPath(recordDir, `${fileBaseName}.css`), row.cssStyle ?? '');
 	if (row.type === 'QUERY') {
 		await writeGeneratedFile(vscode.Uri.joinPath(recordDir, `${fileBaseName}.sql`), row.statement ?? '');
+		await writeGeneratedFile(vscode.Uri.joinPath(recordDir, `${fileBaseName}.options.xml`), row.options ?? '');
 	}
 
 	entries.push({
@@ -1321,6 +1341,55 @@ async function materializeQuickviewRow(
 			recordName: row.title.trim().length > 0 ? `${row.name} - ${row.title}` : row.name,
 			type: row.type,
 			version: row.version,
+			contextType: 'quickview'
+		});
+		entries.push({
+			relativePath: toPosixPath(path.join(config.generatedRootDir, rootName, 'query', `${fileBaseName}.options.xml`)),
+			contentHash: hashContent(row.options ?? ''),
+			table: 'QVQUERY',
+			field: 'OPTIONS',
+			versionField: 'VERSION',
+			guid: row.guid,
+			recordName: row.title.trim().length > 0 ? `${row.name} - ${row.title}` : row.name,
+			type: 'QUERY',
+			version: row.version,
+			contextType: 'quickview'
+		});
+		await materializeDashboardQueryFiles(config, rootDir, rootName, row, entries);
+	}
+}
+
+async function materializeDashboardQueryFiles(
+	config: RuntimeConfig,
+	rootDir: vscode.Uri,
+	rootName: string,
+	row: DbRow,
+	entries: FileIndexEntry[]
+): Promise<void> {
+	if (!row.dashboardQueryGuid) {
+		return;
+	}
+	const recordDir = vscode.Uri.joinPath(rootDir, 'dashboard-query');
+	await vscode.workspace.fs.createDirectory(recordDir);
+	const fileBaseName = [row.name, row.title, row.dashboardQueryGuid]
+		.filter((part) => part.trim().length > 0).map(sanitizePathPart).join('__');
+	const fields = [
+		{ field: 'PARAMSTRING', suffix: 'paramstring.txt', content: row.paramString ?? '' },
+		{ field: 'JSCHARTSCRIPT', suffix: 'jschartscript.js', content: row.jsChartScript ?? '' },
+		{ field: 'CHARTOPTIONS', suffix: 'chartoptions.js', content: row.chartOptions ?? '' }
+	] as const;
+	for (const { field, suffix, content } of fields) {
+		const fileName = `${fileBaseName}.${suffix}`;
+		await writeGeneratedFile(vscode.Uri.joinPath(recordDir, fileName), content);
+		entries.push({
+			relativePath: toPosixPath(path.join(config.generatedRootDir, rootName, 'dashboard-query', fileName)),
+			contentHash: hashContent(content),
+			table: 'QVDASHBOARDQUERY',
+			field,
+			guid: row.dashboardQueryGuid,
+			recordName: `${row.name}${row.title.trim() ? ` - ${row.title}` : ''} (Dashboard-Zuordnung)`,
+			type: 'DASHBOARDQUERY',
+			version: '',
 			contextType: 'quickview'
 		});
 	}
@@ -1391,6 +1460,41 @@ async function readIndex(config: RuntimeConfig): Promise<FileIndex | undefined> 
 	return readJsonFile<FileIndex>(indexUri);
 }
 
+async function pushDashboardQueryUpdate(
+	config: RuntimeConfig,
+	index: FileIndex,
+	entry: FileIndexEntry,
+	content: string
+): Promise<boolean> {
+	const dashboards = index.entries.filter((candidate) => candidate.table === 'QVDASHBOARD');
+	const dashboard = dashboards[0];
+	if (!dashboard || new Set(dashboards.map((candidate) => candidate.guid)).size !== 1) {
+		throw new Error('Dashboard-Version kann nicht eindeutig zugeordnet werden. Bitte zuerst "Reload From ERP" ausfuehren.');
+	}
+	dashboard.contextType ??= 'quickview';
+	dashboard.versionField = 'ANP_VERSION';
+	alignQuickviewVersionFromSiblingEntries(index, dashboard);
+	const versionValue = await resolveQuickviewVersionValue(config, dashboard);
+	if (versionValue === undefined) {
+		return false;
+	}
+
+	logOutput(`[SaveSync] Dashboard-Version target: QVDASHBOARD.ANP_VERSION=${versionValue}, GUID=${dashboard.guid}`);
+	await sendUpdateFields(config, entry, [{ field: entry.field, value: content }]);
+	try {
+		await sendUpdateFields(config, dashboard, [{ field: 'ANP_VERSION', value: versionValue }]);
+	} catch (error) {
+		logOutput(`[SaveSync] Zuordnungsinhalt gespeichert, Dashboard-Version fehlgeschlagen: ${formatError(error)}`);
+		throw new PartialSyncError(
+			'ERP Dashboard Sync: Der Zuordnungsinhalt wurde gespeichert, aber die Dashboard-Version konnte nicht aktualisiert werden. Bitte erneut speichern. Details im Output-Channel.',
+			{ cause: error }
+		);
+	}
+	dashboard.version = versionValue;
+	propagateVersionToSiblingEntries(index, dashboard);
+	return true;
+}
+
 async function pushUpdate(config: RuntimeConfig, entry: FileIndexEntry, content: string): Promise<boolean> {
 	const versionField = entry.contextType === 'quickview' ? entry.versionField ?? getVersionFieldForRecordType(entry.type) : entry.versionField;
 	let versionValue: string | undefined;
@@ -1420,11 +1524,6 @@ async function pushUpdate(config: RuntimeConfig, entry: FileIndexEntry, content:
 		updateFields.push({ field: 'MINORVERSION', value: flowVersionUpdate.minor });
 		updateFields.push({ field: 'PATCHVERSION', value: flowVersionUpdate.patch });
 	}
-	const updateDataRow = buildUpdateDataRow(updateFields);
-	const updateData = toCData(updateDataRow);
-	const whereClause = `GUID='${escapeSqlString(entry.guid)}'`;
-	logOutput('[SaveSync] Transport: soap12');
-	logOutput(`[SaveSync] Target: ${entry.table}.${entry.field}`);
 	if (versionField && versionValue !== undefined) {
 		logOutput(`[SaveSync] Version target: ${entry.table}.${versionField}=${versionValue}`);
 	}
@@ -1433,9 +1532,28 @@ async function pushUpdate(config: RuntimeConfig, entry: FileIndexEntry, content:
 			`[SaveSync] Version target: ${entry.table}.MAJORVERSION=${flowVersionUpdate.major}, ${entry.table}.MINORVERSION=${flowVersionUpdate.minor}, ${entry.table}.PATCHVERSION=${flowVersionUpdate.patch}`
 		);
 	}
+	logOutput(`[SaveSync] Content length: ${content.length}`);
+	await sendUpdateFields(config, entry, updateFields);
+	if (versionValue !== undefined) {
+		entry.version = versionValue;
+	}
+	if (flowVersionUpdate) {
+		entry.version = `${flowVersionUpdate.major}.${flowVersionUpdate.minor}.${flowVersionUpdate.patch}`;
+	}
+	return true;
+}
+
+async function sendUpdateFields(
+	config: RuntimeConfig,
+	entry: FileIndexEntry,
+	updateFields: Array<{ field: string; value: string }>
+): Promise<void> {
+	const updateData = toCData(buildUpdateDataRow(updateFields));
+	const whereClause = `GUID='${escapeSqlString(entry.guid)}'`;
+	logOutput('[SaveSync] Transport: soap12');
+	logOutput(`[SaveSync] Target: ${entry.table}.${updateFields.map(({ field }) => field).join(',')}`);
 	logOutput(`[SaveSync] Record: ${entry.recordName} (${entry.type})`);
 	logOutput(`[SaveSync] GUID: ${entry.guid}`);
-	logOutput(`[SaveSync] Content length: ${content.length}`);
 
 	const soapBody = buildSoapEnvelope(entry.table, updateData, whereClause);
 	logOutput(`[SaveSync] Method: POST`);
@@ -1470,14 +1588,6 @@ async function pushUpdate(config: RuntimeConfig, entry: FileIndexEntry, content:
 		throw lastError;
 	}
 	logOutput('[SaveSync] Request erfolgreich abgeschlossen.');
-	if (versionValue !== undefined) {
-		entry.version = versionValue;
-	}
-	if (flowVersionUpdate) {
-		entry.version = `${flowVersionUpdate.major}.${flowVersionUpdate.minor}.${flowVersionUpdate.patch}`;
-	}
-
-	return true;
 }
 
 function buildXmlUpdateOfflineRequestUrls(configuredUrl: string): string[] {
@@ -1507,8 +1617,9 @@ function buildXmlUpdateOfflineRequestUrls(configuredUrl: string): string[] {
 }
 
 function buildUpdateDataRow(fields: Array<{ field: string; value: string }>): string {
+	// XML normalizes literal CR/CRLF; character references preserve the saved content.
 	const rowContent = fields
-		.map(({ field, value }) => `<${field}>${escapeXml(value)}</${field}>`)
+		.map(({ field, value }) => `<${field}>${escapeXml(value).replace(/\r/g, '&#13;')}</${field}>`)
 		.join('');
 	return `<row>${rowContent}</row>`;
 }
@@ -1769,8 +1880,8 @@ function isDateVersionFormat(value: string): boolean {
 	);
 }
 
-function getVersionFieldForRecordType(type: RecordType): FileIndexEntry['versionField'] {
-	return type === 'QUERY' ? 'VERSION' : 'ANP_VERSION';
+function getVersionFieldForRecordType(type: FileIndexEntry['type']): FileIndexEntry['versionField'] {
+	return type === 'QUERY' ? 'VERSION' : type === 'DASHBOARD' ? 'ANP_VERSION' : undefined;
 }
 
 function toCData(value: string): string {
@@ -2083,14 +2194,16 @@ function buildQuickviewSql(dashboardId: string, includeAnpVersion: boolean): str
 	const dashboardVersionField = includeAnpVersion
 		? "COALESCE(CAST(QVDASHBOARD.ANP_VERSION as varchar(50)), COALESCE(QVDASHBOARD.INFO, ''))"
 		: 'QVDASHBOARD.INFO';
-	return `select qvquery.qvquery,qvquery.title,qvquery.GUID,qvquery.STATEMENT, QVQUERY.JSPAGESCRIPT,QVQUERY.CSSSTYLE, QVQUERY.VERSION, ${anpQueryField}, type='QUERY' from QVQUERY
+	const dashboardQueryFields = ', CAST(QVDASHBOARDQUERY.GUID as varchar(50)) as DASHBOARDQUERY_GUID, QVDASHBOARDQUERY.PARAMSTRING, QVDASHBOARDQUERY.JSCHARTSCRIPT, QVDASHBOARDQUERY.CHARTOPTIONS';
+	const emptyDashboardQueryFields = ", '' as DASHBOARDQUERY_GUID, '' as PARAMSTRING, '' as JSCHARTSCRIPT, '' as CHARTOPTIONS";
+	return `select qvquery.qvquery,qvquery.title,qvquery.GUID,qvquery.STATEMENT, QVQUERY.JSPAGESCRIPT,QVQUERY.CSSSTYLE, QVQUERY.OPTIONS, QVQUERY.VERSION, ${anpQueryField}${dashboardQueryFields}, type='QUERY' from QVQUERY
 join QVDASHBOARDQUERY on QVQUERY.QVQUERY = QVDASHBOARDQUERY.QVQUERY
 join QVDASHBOARD on QVDASHBOARDQUERY.QVDASHBOARD = QVDASHBOARD.QVDASHBOARD
 where QVDASHBOARD.QVDASHBOARD = '${sanitizedId}'
 
 UNION ALL
 
-select QVDASHBOARD.QVDASHBOARD,QVDASHBOARD.title,QVDASHBOARD.GUID,'' as STATEMENT, QVDASHBOARD.JSPAGESCRIPT,QVDASHBOARD.CSSSTYLE, VERSION=${dashboardVersionField}, ${anpDashboardField}, type='DASHBOARD'
+select QVDASHBOARD.QVDASHBOARD,QVDASHBOARD.title,QVDASHBOARD.GUID,'' as STATEMENT, QVDASHBOARD.JSPAGESCRIPT,QVDASHBOARD.CSSSTYLE, '' as OPTIONS, VERSION=${dashboardVersionField}, ${anpDashboardField}${emptyDashboardQueryFields}, type='DASHBOARD'
 from QVDASHBOARD
 where QVDASHBOARD.QVDASHBOARD = '${sanitizedId}'`;
 }
@@ -2157,6 +2270,14 @@ function normalizeDbRow(raw: unknown, contextType: DashboardContextType): DbRow 
 		pick(obj, ['qvquery', 'QVQUERY', 'qvdashboard', 'QVDASHBOARD']) ??
 			(typeValue === 'QUERY' ? 'query' : 'dashboard')
 	);
+	const dashboardQueryGuid = String(pick(obj, ['dashboardquery_guid', 'DASHBOARDQUERY_GUID']) ?? '').trim();
+	const paramString = pick(obj, ['paramstring', 'PARAMSTRING']);
+	const jsChartScript = pick(obj, ['jschartscript', 'JSCHARTSCRIPT']);
+	const chartOptions = pick(obj, ['chartoptions', 'CHARTOPTIONS']);
+	if (typeValue === 'QUERY' && !dashboardQueryGuid
+		&& [paramString, jsChartScript, chartOptions].some((value) => value !== undefined)) {
+		throw new Error(`QVDASHBOARDQUERY-GUID fehlt fuer Query '${name}'. Zusaetzliche Felder koennen nicht sicher zugeordnet werden.`);
+	}
 
 	return {
 		name,
@@ -2165,6 +2286,11 @@ function normalizeDbRow(raw: unknown, contextType: DashboardContextType): DbRow 
 		statement: String(pick(obj, ['statement', 'STATEMENT']) ?? ''),
 		jsPageScript: String(pick(obj, ['jspagescript', 'JSPAGESCRIPT']) ?? ''),
 		cssStyle: String(pick(obj, ['cssstyle', 'CSSSTYLE']) ?? ''),
+		options: String(pick(obj, ['options', 'OPTIONS']) ?? ''),
+		dashboardQueryGuid: typeValue === 'QUERY' ? dashboardQueryGuid || undefined : undefined,
+		paramString: String(paramString ?? ''),
+		jsChartScript: String(jsChartScript ?? ''),
+		chartOptions: String(chartOptions ?? ''),
 		version: String(pick(obj, ['version', 'VERSION', 'anp_version', 'ANP_VERSION']) ?? ''),
 		type: typeValue
 	};

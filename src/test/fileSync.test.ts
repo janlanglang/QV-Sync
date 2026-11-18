@@ -4,6 +4,7 @@ import { readFileSync } from 'fs';
 import { createRequire } from 'module';
 import * as path from 'path';
 import { runInNewContext } from 'vm';
+import { XMLParser } from 'fast-xml-parser';
 
 class TestUri {
 	readonly scheme = 'file';
@@ -49,10 +50,24 @@ interface TestEntry {
 	field: string;
 	version: string;
 	contentHash?: string;
+	table?: string;
+	guid?: string;
+	type?: string;
+	versionField?: string;
 }
 
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const hash = (content: string) => createHash('sha256').update(content).digest('hex');
+
+function readUpdate(body: string): { table: string; sWhere: string; fields: Record<string, string> } {
+	const parser = new XMLParser({ trimValues: false, parseTagValue: false, htmlEntities: true });
+	const soap: { 'soap12:Envelope': { 'soap12:Body': {
+		xmlUpdateOffline: { table: string; sWhere: string; updateData: string };
+	} } } = parser.parse(body);
+	const call = soap['soap12:Envelope']['soap12:Body'].xmlUpdateOffline;
+	const data: { row: Record<string, string> } = parser.parse(call.updateData);
+	return { table: call.table, sWhere: call.sWhere, fields: data.row };
+}
 
 interface TestPickItem {
 	label: string;
@@ -80,6 +95,7 @@ function createHarness(options: {
 	const secretReads: string[] = [];
 	const picks: ((items: TestPickItem[]) => TestPickItem | undefined)[] = [];
 	const inputs: (string | undefined)[] = [];
+	const inputPrompts: string[] = [];
 	const informationAnswers: (string | undefined)[] = [];
 	const information: string[] = [];
 	const fetchUrls: string[] = [];
@@ -91,6 +107,7 @@ function createHarness(options: {
 		xmlUpdateOfflineSoapUrl: 'http://localhost/utils.asmx/xmlUpdateOffline'
 	};
 	let post: (body: string) => Promise<void> = async () => {};
+	let fetchRows = async (_sql: string, rows: Record<string, unknown>[]): Promise<Record<string, unknown>[]> => rows;
 	let failingWrite: string | undefined;
 	const write = (uri: TestUri, text: string) => files.set(uri.fsPath, new TextEncoder().encode(text));
 	const json = (uri: TestUri) => JSON.parse(new TextDecoder().decode(files.get(uri.fsPath)));
@@ -165,7 +182,7 @@ function createHarness(options: {
 				.map((file) => new TestUri(file)),
 			onDidSaveTextDocument: save.register,
 			createFileSystemWatcher: (pattern: string) => {
-				assert.strictEqual(pattern, '**/*.{js,css,sql,xml}');
+				assert.strictEqual(pattern, '**/*.{js,css,sql,xml,txt}');
 				return { dispose() {}, onDidChange: change.register, onDidCreate: create.register };
 			},
 			fs: {
@@ -181,7 +198,7 @@ function createHarness(options: {
 				writeFile: async (uri: TestUri, bytes: Uint8Array) => {
 					if (uri.fsPath === failingWrite) { throw new Error('Write failed'); }
 					files.set(uri.fsPath, bytes);
-					if (/\.(js|css|sql|xml)$/.test(uri.fsPath)) { change.fire(uri); }
+					if (/\.(js|css|sql|xml|txt)$/.test(uri.fsPath)) { change.fire(uri); }
 				},
 				createDirectory: async () => {}
 			}
@@ -208,7 +225,10 @@ function createHarness(options: {
 				assert.ok(pick, `Unexpected dashboard/credential prompt: ${items.map((item) => item.label).join(', ')}`);
 				return pick(items);
 			},
-			showInputBox: async () => inputs.shift(),
+			showInputBox: async (options: { prompt?: string }) => {
+				inputPrompts.push(options.prompt ?? '');
+				return inputs.shift();
+			},
 			showOpenDialog: async () => selectedFolder ? [selectedFolder] : undefined,
 			setStatusBarMessage: () => {},
 			withProgress: async (_options: unknown, action: (progress: unknown) => Promise<void>) =>
@@ -229,14 +249,19 @@ function createHarness(options: {
 			}
 			const sql = new URL(url).searchParams.get('sql') ?? '';
 			const context = contexts.find((candidate) => sql.includes(`'${candidate.id}'`)) ?? first;
+			const rows = request.method === 'POST' ? [] : await fetchRows(sql, [{
+				type: 'QUERY', qvquery: context.id, guid: context.guid, version: '20261117',
+				jspagescript: 'from ERP', cssstyle: 'from ERP', statement: 'select 1',
+				xmldefinition: 'from ERP', javascript: 'from ERP', sqlstatement: 'select 1',
+				majorversion: '2026', minorversion: '11', patchversion: '17'
+			}, ...(context.contextType === 'quickview' ? [{
+				type: 'DASHBOARD', qvdashboard: context.id, guid: `${context.guid}-dashboard`, version: '20261117',
+				jspagescript: 'dashboard script', cssstyle: 'dashboard css'
+			}] : [])]);
+			const xmlContent = JSON.stringify(rows).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 			return {
 				ok: true,
-				text: async () => request.method === 'POST' ? '{}' : `<string>${JSON.stringify([{
-					type: 'QUERY', qvquery: context.id, guid: context.guid, version: '20261117',
-					jspagescript: 'from ERP', cssstyle: 'from ERP', statement: 'select 1',
-					xmldefinition: 'from ERP', javascript: 'from ERP', sqlstatement: 'select 1',
-					majorversion: '2026', minorversion: '11', patchversion: '17'
-				}])}</string>`
+				text: async () => request.method === 'POST' ? '{}' : `<string>${xmlContent}</string>`
 			};
 		}
 	}, { filename });
@@ -250,11 +275,12 @@ function createHarness(options: {
 	return {
 		...first, parent, second, contexts, folders, folderSettings, secrets, secretReads,
 		save, change, create, logs, errors, requests, settings, write, json, files, addContext,
-		inputs, informationAnswers, information, fetchUrls,
+		inputs, inputPrompts, informationAnswers, information, fetchUrls,
 		pick: (choose: (items: TestPickItem[]) => TestPickItem | undefined) => picks.push(choose),
 		chooseFolder: (uri: TestUri) => { selectedFolder = uri; },
 		confirm: (answer: string) => { confirmation = answer; },
 		setPost: (action: typeof post) => { post = action; },
+		setRows: (action: typeof fetchRows) => { fetchRows = action; },
 		failWrite: (uri: TestUri) => { failingWrite = uri.fsPath; },
 		run: async (name: string) => {
 			const command = commands.get(`erp-dashboard-sync.${name}`);
@@ -600,5 +626,312 @@ suite('File synchronization events', () => {
 		h.create.fire(unmanaged);
 		await waitFor(() => h.logs.some((line) => line.includes('Datei nicht im Index')));
 		assert.strictEqual(h.requests.length, 0);
+	});
+});
+
+suite('Dashboard-query fields', () => {
+	let h: ReturnType<typeof createHarness>;
+	setup(() => { h = createHarness(); });
+	teardown(() => { h.dispose(); });
+
+	test('uploads raw assignment fields and separately updates only their parent dashboard version', async () => {
+		const values: Record<string, string> = {
+			PARAMSTRING: '  a=1&b=<value>\r\n',
+			JSCHARTSCRIPT: 'function render() {\n  return "<chart>";\n}\n',
+			CHARTOPTIONS: '({ callback: function (x) { return x < 5; } })\n'
+		};
+		h.setRows(async (sql, rows) => {
+			assert.ok(sql.includes('QVQUERY') && sql.includes('CAST(QVDASHBOARDQUERY.GUID as varchar(50)) as DASHBOARDQUERY_GUID'));
+			for (const field of Object.keys(values)) { assert.ok(sql.includes(`QVDASHBOARDQUERY.${field}`)); }
+			return rows.map((row) => row.type === 'QUERY'
+				? { ...row, version: 'legacy-version', DASHBOARDQUERY_GUID: 'assignment-guid', ...values } : row);
+		});
+		await h.reload();
+		await delay(400);
+		assert.strictEqual(h.requests.length, 0, 'Generated files must not be uploaded');
+		const entries = h.index().entries.filter((entry) => entry.table === 'QVDASHBOARDQUERY');
+		assert.strictEqual(entries.length, 3);
+		const suffixes: Record<string, string> = {
+			PARAMSTRING: '.paramstring.txt', JSCHARTSCRIPT: '.jschartscript.js', CHARTOPTIONS: '.chartoptions.js'
+		};
+		for (const entry of entries) {
+			assert.ok(entry.relativePath.startsWith('erp-dashboard/test/dashboard-query/'));
+			assert.ok(entry.relativePath.endsWith(suffixes[entry.field]));
+			assert.strictEqual(entry.guid, 'assignment-guid');
+			assert.strictEqual(entry.versionField, undefined);
+			const uri = TestUri.joinPath(h.root, ...entry.relativePath.split('/'));
+			assert.strictEqual(new TextDecoder().decode(h.files.get(uri.fsPath)), values[entry.field]);
+			h.write(uri, `${values[entry.field]}changed`);
+			h.change.fire(uri);
+		}
+		await waitFor(() => h.index().entries.filter((entry) => entry.table === 'QVDASHBOARDQUERY')
+			.every((entry) => entry.contentHash === hash(`${values[entry.field]}changed`)));
+		assert.strictEqual(h.requests.length, 6);
+		const updates = h.requests.map(readUpdate);
+		for (const call of updates.filter((update) => update.table === 'QVDASHBOARDQUERY')) {
+			assert.strictEqual(call.table, 'QVDASHBOARDQUERY');
+			assert.strictEqual(call.sWhere, "GUID='assignment-guid'");
+			const fields = Object.keys(call.fields);
+			assert.strictEqual(fields.length, 1, 'Only the changed content field, no invented version column');
+			const field = fields[0];
+			assert.ok(field && field in values);
+			assert.strictEqual(call.fields[field], `${values[field]}changed`);
+		}
+		const parentUpdates = updates.filter((update) => update.table === 'QVDASHBOARD');
+		assert.strictEqual(parentUpdates.length, 3);
+		for (const call of parentUpdates) {
+			assert.strictEqual(call.sWhere, "GUID='guid-dashboard'");
+			assert.deepStrictEqual(Object.keys(call.fields), ['ANP_VERSION']);
+			assert.ok(h.index().entries.filter((entry) => entry.table === 'QVDASHBOARD')
+				.every((entry) => entry.version === call.fields.ANP_VERSION));
+		}
+		assert.ok(h.index().entries.filter((entry) => entry.table === 'QVQUERY')
+			.every((entry) => entry.version === 'legacy-version'));
+		assert.deepStrictEqual(h.errors, []);
+	});
+
+	test('keeps repeated queries separate and materializes NULL/empty or omitted values as empty files', async () => {
+		h.setRows(async (_sql, rows) => [
+			{ ...rows[0], DASHBOARDQUERY_GUID: 'assignment-a', PARAMSTRING: null, JSCHARTSCRIPT: '', CHARTOPTIONS: null },
+			{ ...rows[0], DASHBOARDQUERY_GUID: 'assignment-b', PARAMSTRING: 'second', CHARTOPTIONS: '({})' }
+		]);
+		await h.reload();
+		const entries = h.index().entries.filter((entry) => entry.table === 'QVDASHBOARDQUERY');
+		assert.strictEqual(entries.length, 6);
+		assert.strictEqual(new Set(entries.map((entry) => entry.relativePath)).size, 6);
+		assert.strictEqual(entries.filter((entry) => entry.guid === 'assignment-a').length, 3);
+		assert.strictEqual(entries.filter((entry) => entry.guid === 'assignment-b').length, 3);
+		for (const entry of entries.filter((candidate) => candidate.guid === 'assignment-a')) {
+			const uri = TestUri.joinPath(h.root, ...entry.relativePath.split('/'));
+			assert.strictEqual(new TextDecoder().decode(h.files.get(uri.fsPath)), '');
+		}
+		assert.ok(entries.some((entry) => entry.guid === 'assignment-b' && entry.field === 'JSCHARTSCRIPT'
+			&& entry.contentHash === hash('')));
+		assert.deepStrictEqual(h.errors, []);
+	});
+
+	test('supports legacy indexes before reload and missing new files without blocking existing uploads', async () => {
+		assert.ok(!h.index().entries.some((entry) => entry.table === 'QVDASHBOARDQUERY'));
+		h.write(h.js, 'legacy project save');
+		h.change.fire(h.js);
+		await waitFor(() => h.index().entries[0].contentHash === hash('legacy project save'));
+		assert.strictEqual(h.index().entries.length, 2, 'No mandatory new entries before an ERP reload');
+		assert.strictEqual(h.requests.length, 1);
+		assert.ok(h.requests[0].includes('<table>QVQUERY</table>'));
+
+		h.setRows(async (_sql, rows) => rows.map((row) => ({
+			...row, DASHBOARDQUERY_GUID: 'assignment-guid', PARAMSTRING: 'p=1', JSCHARTSCRIPT: '', CHARTOPTIONS: '({})'
+		})));
+		await h.reload();
+		const param = h.index().entries.find((entry) => entry.field === 'PARAMSTRING');
+		assert.ok(param);
+		const uri = TestUri.joinPath(h.root, ...param.relativePath.split('/'));
+		h.files.delete(uri.fsPath);
+		h.change.fire(uri);
+		h.write(h.css, 'existing css edit');
+		h.change.fire(h.css);
+		await waitFor(() => h.index().entries.find((entry) => entry.field === 'CSSSTYLE')?.contentHash === hash('existing css edit'));
+		assert.strictEqual(h.requests.length, 2);
+		assert.ok(!h.files.has(uri.fsPath));
+		assert.ok(h.logs.some((line) => line.includes('Datei inzwischen geloescht')));
+		assert.deepStrictEqual(h.errors, []);
+		await h.reload();
+		assert.strictEqual(new TextDecoder().decode(h.files.get(uri.fsPath)), 'p=1');
+	});
+
+	test('retains the existing ANP_VERSION fallback without dropping the new fields', async () => {
+		h.setRows(async (sql, rows) => {
+			if (/\.anp_version/i.test(sql)) { throw new Error("Invalid column name 'ANP_VERSION'."); }
+			assert.ok(sql.includes('QVDASHBOARDQUERY.PARAMSTRING'));
+			return rows.map((row) => ({ ...row, DASHBOARDQUERY_GUID: 'assignment-guid', PARAMSTRING: 'p=1' }));
+		});
+		await h.reload();
+		assert.strictEqual(h.fetchUrls.length, 2);
+		assert.strictEqual(h.index().entries.filter((entry) => entry.table === 'QVDASHBOARDQUERY').length, 3);
+		assert.deepStrictEqual(h.errors, []);
+	});
+
+	test('never treats unrelated ERP failures as a compatibility fallback', async () => {
+		const index = h.files.get(h.indexUri.fsPath);
+		h.setRows(async () => { throw new Error('HTTP 503 ERP unavailable'); });
+		await assert.rejects(h.reload(), /HTTP 503 ERP unavailable/);
+		assert.strictEqual(h.fetchUrls.length, 1);
+		assert.strictEqual(h.files.get(h.indexUri.fsPath), index);
+		assert.strictEqual(h.errors.length, 1);
+	});
+
+	test('rejects new fields without an assignment GUID instead of writing to the query GUID', async () => {
+		const index = h.files.get(h.indexUri.fsPath);
+		h.setRows(async (_sql, rows) => rows.map((row) => ({ ...row, PARAMSTRING: 'cannot map safely' })));
+		await assert.rejects(h.reload(), /QVDASHBOARDQUERY-GUID fehlt/);
+		assert.strictEqual(h.files.get(h.indexUri.fsPath), index);
+		assert.strictEqual(h.requests.length, 0);
+	});
+
+	async function prepareAssignment(dashboardVersion = '20261117') {
+		h.setRows(async (_sql, rows) => rows.map((row) => row.type === 'QUERY'
+			? { ...row, DASHBOARDQUERY_GUID: 'assignment-guid', PARAMSTRING: 'p=1', JSCHARTSCRIPT: '', CHARTOPTIONS: '({})' }
+			: { ...row, version: dashboardVersion }));
+		await h.reload();
+		const entry = h.index().entries.find((candidate) => candidate.field === 'PARAMSTRING');
+		assert.ok(entry);
+		return { entry, uri: TestUri.joinPath(h.root, ...entry.relativePath.split('/')) };
+	}
+
+	test('checks the parent version before upload and reuses its daily decision', async () => {
+		const { uri } = await prepareAssignment('17');
+		h.inputs.push('18');
+		h.write(uri, 'first change');
+		h.change.fire(uri);
+		await waitFor(() => h.index().entries.find((entry) => entry.field === 'PARAMSTRING')?.contentHash === hash('first change'));
+		assert.strictEqual(h.inputPrompts.length, 1);
+		assert.ok(h.index().entries.filter((entry) => entry.table === 'QVDASHBOARD').every((entry) => entry.version === '18'));
+		h.write(uri, 'second change');
+		h.save.fire({ uri, languageId: 'plaintext' });
+		await waitFor(() => h.index().entries.find((entry) => entry.field === 'PARAMSTRING')?.contentHash === hash('second change'));
+		assert.strictEqual(h.inputPrompts.length, 1, 'No repeated version prompt on the same day');
+		const parentUpdates = h.requests.map(readUpdate).filter((update) => update.table === 'QVDASHBOARD');
+		assert.strictEqual(parentUpdates.length, 2);
+		assert.ok(parentUpdates.every((update) => update.fields.ANP_VERSION === '18'));
+		assert.deepStrictEqual(h.errors, []);
+	});
+
+	test('cancelling the dashboard version prompt prevents both remote writes', async () => {
+		const { entry, uri } = await prepareAssignment('17');
+		h.inputs.push(undefined);
+		h.write(uri, 'cancelled change');
+		h.change.fire(uri);
+		await waitFor(() => h.logs.some((line) => line.includes('Decision=cancelled-by-user')));
+		assert.strictEqual(h.requests.length, 0);
+		assert.strictEqual(h.index().entries.find((candidate) => candidate.field === 'PARAMSTRING')?.contentHash, entry.contentHash);
+		assert.ok(h.index().entries.filter((candidate) => candidate.table === 'QVDASHBOARD').every((candidate) => candidate.version === '17'));
+		assert.deepStrictEqual(h.errors, []);
+	});
+
+	test('keeps content pending after a failed dashboard version write and retries on the next save', async () => {
+		const { entry, uri } = await prepareAssignment();
+		h.setPost(async (body) => {
+			if (readUpdate(body).table === 'QVDASHBOARD') { throw new Error('Parent version unavailable'); }
+		});
+		h.write(uri, 'pending change');
+		h.change.fire(uri);
+		await waitFor(() => h.errors.length === 1);
+		assert.ok(h.errors[0].includes('Zuordnungsinhalt wurde gespeichert'));
+		assert.strictEqual(h.index().entries.find((candidate) => candidate.field === 'PARAMSTRING')?.contentHash, entry.contentHash);
+		assert.ok(h.index().entries.filter((candidate) => candidate.table === 'QVDASHBOARD').every((candidate) => candidate.version === '20261117'));
+		h.setPost(async () => {});
+		h.save.fire({ uri, languageId: 'plaintext' });
+		await waitFor(() => h.index().entries.find((candidate) => candidate.field === 'PARAMSTRING')?.contentHash === hash('pending change'));
+		const updates = h.requests.map(readUpdate);
+		assert.strictEqual(updates.filter((update) => update.table === 'QVDASHBOARDQUERY').length, 2);
+		const last = updates[updates.length - 1];
+		assert.ok(last);
+		assert.strictEqual(last.table, 'QVDASHBOARD');
+		assert.ok(h.index().entries.filter((candidate) => candidate.table === 'QVDASHBOARD').every((candidate) => candidate.version === last.fields.ANP_VERSION));
+	});
+
+	test('never advances the dashboard version when its assignment content update fails', async () => {
+		const { entry, uri } = await prepareAssignment();
+		h.setPost(async () => { throw new Error('Content update failed'); });
+		h.write(uri, 'failed change');
+		h.change.fire(uri);
+		await waitFor(() => h.errors.length === 1);
+		assert.ok(h.requests.map(readUpdate).every((update) => update.table === 'QVDASHBOARDQUERY'));
+		assert.strictEqual(h.index().entries.find((candidate) => candidate.field === 'PARAMSTRING')?.contentHash, entry.contentHash);
+		assert.ok(h.index().entries.filter((candidate) => candidate.table === 'QVDASHBOARD').every((candidate) => candidate.version === '20261117'));
+	});
+
+	test('reuploads a reverted file after a partial failure even when it matches the previous index hash', async () => {
+		const { uri } = await prepareAssignment();
+		h.setPost(async (body) => {
+			if (readUpdate(body).table === 'QVDASHBOARD') { throw new Error('Parent version unavailable'); }
+		});
+		h.write(uri, 'temporary remote change');
+		h.change.fire(uri);
+		await waitFor(() => h.errors.length === 1);
+		h.setPost(async () => {});
+		h.write(uri, 'p=1');
+		h.save.fire({ uri, languageId: 'plaintext' });
+		await waitFor(() => h.logs.filter((line) => line.includes('Request erfolgreich abgeschlossen.')).length === 3);
+		const updates = h.requests.map(readUpdate).filter((update) => update.table === 'QVDASHBOARDQUERY');
+		assert.strictEqual(updates.length, 2);
+		assert.strictEqual(updates[1].fields.PARAMSTRING, 'p=1');
+		assert.strictEqual(h.index().entries.find((candidate) => candidate.field === 'PARAMSTRING')?.contentHash, hash('p=1'));
+	});
+
+	test('requires an unambiguous parent dashboard in legacy assignment indexes', async () => {
+		const { uri } = await prepareAssignment();
+		const index = h.index();
+		index.entries = index.entries.filter((entry) => entry.table !== 'QVDASHBOARD');
+		h.writeIndex(index);
+		h.write(uri, 'cannot version safely');
+		h.change.fire(uri);
+		await waitFor(() => h.errors.length === 1);
+		assert.ok(h.logs.some((line) => line.includes('Dashboard-Version kann nicht eindeutig zugeordnet werden')));
+		assert.strictEqual(h.requests.length, 0);
+	});
+});
+
+suite('Query OPTIONS XML', () => {
+	let h: ReturnType<typeof createHarness>;
+	setup(() => { h = createHarness(); });
+	teardown(() => { h.dispose(); });
+
+	test('preserves raw XML and synchronizes OPTIONS with query VERSION, not the dashboard version', async () => {
+		const xml = '<?xml version="1.0"?>\r\n<options label="A &amp; B"><![CDATA[x < 5 && y > 0]]></options>\r\n';
+		h.setRows(async (sql, rows) => {
+			assert.ok(sql.includes('QVQUERY.OPTIONS'));
+			assert.ok(sql.includes("'' as OPTIONS"));
+			return rows.map((row) => ({ ...row, OPTIONS: row.type === 'QUERY' ? xml : 'not a query option' }));
+		});
+		await h.reload();
+		await delay(400);
+		const entries = h.index().entries.filter((entry) => entry.field === 'OPTIONS');
+		assert.strictEqual(entries.length, 1);
+		const entry = entries[0];
+		assert.ok(entry);
+		assert.ok(entry.relativePath.startsWith('erp-dashboard/test/query/'));
+		assert.ok(entry.relativePath.endsWith('.options.xml'));
+		assert.strictEqual(entry.table, 'QVQUERY');
+		assert.strictEqual(entry.guid, 'guid');
+		assert.strictEqual(entry.versionField, 'VERSION');
+		const uri = TestUri.joinPath(h.root, ...entry.relativePath.split('/'));
+		assert.strictEqual(new TextDecoder().decode(h.files.get(uri.fsPath)), xml);
+		assert.strictEqual(h.requests.length, 0);
+		const changed = xml.replace('A &amp; B', 'C &amp; D');
+		h.write(uri, changed);
+		h.change.fire(uri);
+		await waitFor(() => h.index().entries.find((candidate) => candidate.field === 'OPTIONS')?.contentHash === hash(changed));
+		assert.strictEqual(h.requests.length, 1);
+		const update = readUpdate(h.requests[0]);
+		assert.strictEqual(update.table, 'QVQUERY');
+		assert.strictEqual(update.sWhere, "GUID='guid'");
+		assert.deepStrictEqual(Object.keys(update.fields).sort(), ['OPTIONS', 'VERSION']);
+		assert.strictEqual(update.fields.OPTIONS, changed);
+		assert.ok(h.index().entries.filter((candidate) => candidate.table === 'QVQUERY').every((candidate) => candidate.version === update.fields.VERSION));
+		assert.ok(h.index().entries.filter((candidate) => candidate.table === 'QVDASHBOARD').every((candidate) => candidate.version === '20261117'));
+		assert.deepStrictEqual(h.errors, []);
+	});
+
+	test('supports old indexes and missing OPTIONS files, and materializes NULL as empty XML content', async () => {
+		assert.ok(!h.index().entries.some((entry) => entry.field === 'OPTIONS'));
+		h.write(h.js, 'before reload');
+		h.change.fire(h.js);
+		await waitFor(() => h.index().entries[0].contentHash === hash('before reload'));
+		assert.strictEqual(h.index().entries.length, 2);
+		h.setRows(async (_sql, rows) => rows.map((row) => ({ ...row, OPTIONS: null })));
+		await h.reload();
+		const entry = h.index().entries.find((candidate) => candidate.field === 'OPTIONS');
+		assert.ok(entry);
+		const uri = TestUri.joinPath(h.root, ...entry.relativePath.split('/'));
+		assert.strictEqual(new TextDecoder().decode(h.files.get(uri.fsPath)), '');
+		h.files.delete(uri.fsPath);
+		h.change.fire(uri);
+		h.write(h.css, 'after reload');
+		h.change.fire(h.css);
+		await waitFor(() => h.index().entries.find((candidate) => candidate.field === 'CSSSTYLE')?.contentHash === hash('after reload'));
+		assert.strictEqual(h.requests.length, 2);
+		assert.ok(!h.files.has(uri.fsPath));
+		assert.deepStrictEqual(h.errors, []);
 	});
 });

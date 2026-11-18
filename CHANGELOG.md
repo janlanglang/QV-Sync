@@ -8,6 +8,17 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 - No changes yet.
 
+## [0.3.9] - 2026-11-18
+
+- Materialize `QVQUERY.OPTIONS` as an unchanged `.options.xml` file and synchronize edits with the existing query versioning; existing indexes remain supported before reload.
+- Check and update the parent `QVDASHBOARD.ANP_VERSION` for dashboard-query changes; retain pending synchronization on partial failure and prevent writes when version selection is cancelled.
+
+## [0.3.8] - 2026-11-18
+
+- Materialize `QVDASHBOARDQUERY.PARAMSTRING`, `JSCHARTSCRIPT` and `CHARTOPTIONS` as separate assignment-GUID-based files and upload edits to the correct assignment row.
+- Preserve existing project/index support before reload; additional files are optional until materialized. Include indexed TXT files in filesystem sync.
+- Preserve carriage returns in SOAP content updates and provide a consistently German README.
+
 ## [0.3.7] - 2026-11-18
 
 - Detect external changes to indexed JS/CSS/SQL/XML files in addition to editor saves, independent of editor language mode.
