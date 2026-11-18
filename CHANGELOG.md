@@ -8,6 +8,10 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 - No changes yet.
 
+## [1.0.0] - 2026-11-18
+
+- Bundle a Copilot Chat skill with detailed Quickview, Flow, ERP sync, data-service, documentation, and anonymized example references for safely editing materialized files.
+
 ## [0.3.9] - 2026-11-18
 
 - Materialize `QVQUERY.OPTIONS` as an unchanged `.options.xml` file and synchronize edits with the existing query versioning; existing indexes remain supported before reload.

@@ -2,6 +2,27 @@
 
 VS-Code-Erweiterung zum Synchronisieren von APplus-Quickviews und -Flowboards mit lokalen Dateien.
 
+## Skill
+**Copilot-Skill ausprobieren:** Öffne Copilot Chat nach der Installation der
+Extension. In unterstützten VS-Code-Versionen kannst du `/erp-dashboard-sync`
+aufrufen oder Copilot den Skill passend zur Aufgabe laden lassen:
+
+**`/erp-dashboard-sync Prüfe den PARAMSTRING dieser indizierten Query zusammen mit SQL und OPTIONS. Erkläre den passenden Filter und ändere nichts, was ungefragt ins ERP hochladen könnte.`**
+
+**Weitere Beispiele:** **`/erp-dashboard-sync Erweitere das Flowboard: prüfe zuerst SQL/XML/JavaScript und die Bindungen im vorhandenen Flow.`** · **`/erp-dashboard-sync Erkläre, welche ERP-Zuordnung diese materialisierte Datei hat und ob ihr Speichern automatisch synchronisiert.`**
+
+
+Die Erweiterung trägt den Skill `erp-dashboard-sync` für Copilot Chat bei.
+Er enthält Hinweise zu Datei-/ERP-Feldzuordnungen, Quickview- und Flow-
+Kontexten sowie zur sicheren Bearbeitung der materialisierten Dateien. Dazu
+werden vertiefende Referenzen für Plugin-Sync, Quickviews, Flowboards,
+ERP-Datenzugriffe, anonymisierte Beispielmuster und Projektdokumentation
+mitgeliefert. Copilot kann ihn bei passenden Aufgaben automatisch laden; in
+unterstützten VS-Code-Versionen ist er außerdem über die Skill-Auswahl
+beziehungsweise Slash-Befehle verfügbar. Die Skill-Unterstützung hängt von
+der installierten VS-Code-/Copilot-Version und dem verwendeten Chat-Harness
+ab.
+
 ## Funktionen
 
 - Unterstützt mehrere unabhängige Dashboard-Ordner in einem gemeinsamen übergeordneten Ordner oder einem Multi-Root-Workspace:
