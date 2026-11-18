@@ -8,6 +8,13 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 - No changes yet.
 
+## [0.3.7] - 2026-11-18
+
+- Detect external changes to indexed JS/CSS/SQL/XML files in addition to editor saves, independent of editor language mode.
+- Serialize uploads and reloads, debounce file events, and persist content hashes to avoid duplicate uploads and reload feedback loops.
+- Support nested dashboard folders and multi-root workspaces while reusing existing local configurations, indexes and folder-scoped credentials.
+- Add dashboard selection for commands, reload-all, per-context startup reload and resource-scoped VS Code settings.
+
 ## [0.3.5] - 2026-07-21
 
 - Updated extension icon file.

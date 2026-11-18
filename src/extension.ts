@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import { createHash } from 'crypto';
 import { XMLParser } from 'fast-xml-parser';
 import * as httpntlm from 'httpntlm';
 
@@ -26,8 +27,14 @@ interface FlowVersionState {
 	pendingBump?: FlowVersionBump;
 }
 
+interface DashboardContext {
+	uri: vscode.Uri;
+	workspaceFolder: vscode.WorkspaceFolder;
+}
+
 interface RuntimeConfig {
 	workspaceFolder: vscode.WorkspaceFolder;
+	contextRoot: vscode.Uri;
 	localConfigUri: vscode.Uri;
 	localConfig: LocalConfig;
 	dbFetchJsonUrl: string;
@@ -68,6 +75,7 @@ interface DbRow {
 
 interface FileIndexEntry {
 	relativePath: string;
+	contentHash?: string;
 	table: 'QVQUERY' | 'QVDASHBOARD' | 'FLOWBOARD';
 	field: 'JSPAGESCRIPT' | 'CSSSTYLE' | 'STATEMENT' | 'XMLDEFINITION' | 'JAVASCRIPT' | 'SQLSTATEMENT';
 	versionField?: 'VERSION' | 'ANP_VERSION';
@@ -104,8 +112,38 @@ const ONBOARDING_DEFAULTS = {
 	authMode: 'ntlm' as AuthMode,
 	tlsAllowInsecure: true
 };
-let deprecatedSettingsMigrationCompleted = false;
+const migratedWorkspaceFolders = new Set<string>();
 let extensionContext: vscode.ExtensionContext | undefined;
+let syncQueue: Promise<void> = Promise.resolve();
+const pendingFileChanges = new Map<string, ReturnType<typeof setTimeout>>();
+const synchronizedContentHashes = new Map<string, string>();
+
+function enqueueSyncOperation(operation: () => Promise<void>): Promise<void> {
+	const result = syncQueue.then(operation);
+	syncQueue = result.catch((error: unknown) => {
+		logOutput(`[Sync] Fehlgeschlagen: ${formatError(error)}`);
+		vscode.window.showErrorMessage('ERP Dashboard Sync: Synchronisierung fehlgeschlagen. Details im Output-Channel.');
+	});
+	return result;
+}
+
+function scheduleFileSync(uri: vscode.Uri, source: 'save' | 'filesystem'): void {
+	const key = uri.toString();
+	const pending = pendingFileChanges.get(key);
+	if (pending) {
+		clearTimeout(pending);
+	}
+	pendingFileChanges.set(key, setTimeout(() => {
+		pendingFileChanges.delete(key);
+		void enqueueSyncOperation(() => syncFile(uri, source)).catch(() => {
+			// enqueueSyncOperation reports errors and keeps subsequent uploads running.
+		});
+	}, 300));
+}
+
+function hashContent(content: string): string {
+	return createHash('sha256').update(content).digest('hex');
+}
 
 function logOutput(message: string): void {
 	OUTPUT_CHANNEL.appendLine(`[${new Date().toISOString()}] ${message}`);
@@ -125,13 +163,20 @@ export function activate(context: vscode.ExtensionContext): void {
 
 	context.subscriptions.push(
 		vscode.commands.registerCommand('erp-dashboard-sync.initializeWorkspace', async () => {
-			await initializeWorkspace(true);
+			const contexts = await selectDashboardContexts('initialize');
+			const context = contexts?.[0];
+			if (context) {
+				await enqueueSyncOperation(() => initializeWorkspace(true, context));
+			}
 		})
 	);
 
 	context.subscriptions.push(
 		vscode.commands.registerCommand('erp-dashboard-sync.refreshFromErp', async () => {
-			await initializeWorkspace(false);
+			const contexts = await selectDashboardContexts('reload');
+			if (contexts) {
+				await reloadContexts(contexts);
+			}
 		})
 	);
 
@@ -154,27 +199,37 @@ export function activate(context: vscode.ExtensionContext): void {
 	);
 
 	context.subscriptions.push(
-		vscode.workspace.onDidSaveTextDocument(async (document) => {
-			await syncDocumentOnSave(document);
+		vscode.workspace.onDidSaveTextDocument((document) => {
+			scheduleFileSync(document.uri, 'save');
 		})
 	);
 
-	void triggerStartupReloadIfConfigured();
+	const watcher = vscode.workspace.createFileSystemWatcher('**/*.{js,css,sql,xml}');
+	context.subscriptions.push(
+		watcher,
+		watcher.onDidChange((uri) => scheduleFileSync(uri, 'filesystem')),
+		watcher.onDidCreate((uri) => scheduleFileSync(uri, 'filesystem')),
+		new vscode.Disposable(() => {
+			for (const timer of pendingFileChanges.values()) {
+				clearTimeout(timer);
+			}
+			pendingFileChanges.clear();
+		})
+	);
+
+	void triggerStartupReloadIfConfigured().catch((error: unknown) => {
+		logOutput(`[StartupReload] Fehlgeschlagen: ${formatError(error)}`);
+		vscode.window.showErrorMessage('ERP Dashboard Sync: Startup-Reload fehlgeschlagen. Details im Output-Channel.');
+	});
 }
 
 export function deactivate(): void {
 	OUTPUT_CHANNEL.dispose();
 }
 
-async function initializeWorkspace(promptForDashboard: boolean): Promise<void> {
-	const workspaceFolder = getPrimaryWorkspaceFolder();
-	if (!workspaceFolder) {
-		vscode.window.showErrorMessage('ERP Dashboard Sync: Bitte zuerst einen Workspace-Ordner oeffnen.');
-		return;
-	}
-
-	await ensureWorkspaceBootstrapSettings(workspaceFolder);
-	const canContinue = await ensureCredentialsForInitialization(workspaceFolder);
+async function initializeWorkspace(promptForDashboard: boolean, context: DashboardContext): Promise<void> {
+	await ensureWorkspaceBootstrapSettings(context.workspaceFolder);
+	const canContinue = await ensureCredentialsForInitialization(context);
 	if (!canContinue) {
 		return;
 	}
@@ -182,12 +237,12 @@ async function initializeWorkspace(promptForDashboard: boolean): Promise<void> {
 	await vscode.window.withProgress(
 		{
 			location: vscode.ProgressLocation.Notification,
-			title: 'ERP Dashboard Sync: Lade Dashboard-Dateien',
+			title: `ERP Dashboard Sync: Lade Dashboard-Dateien (${context.uri.fsPath})`,
 			cancellable: false
 		},
 		async (progress) => {
 			progress.report({ message: 'Konfiguration laden...' });
-			const config = await loadRuntimeConfig(workspaceFolder, promptForDashboard);
+			const config = await loadRuntimeConfig(context, promptForDashboard);
 			if (!config) {
 				if (!promptForDashboard) {
 					vscode.window.showInformationMessage(
@@ -259,21 +314,21 @@ async function applySettingIfMissing<T>(
 		return 0;
 	}
 
-	await settings.update(key, value, vscode.ConfigurationTarget.Workspace);
+	await settings.update(key, value, vscode.ConfigurationTarget.WorkspaceFolder);
 	logOutput(
 		`[Onboarding] Workspace-Setting gesetzt: erpDashboardSync.${key}=${typeof value === 'string' ? `'${value}'` : String(value)} (${workspaceFolder.uri.fsPath})`
 	);
 	return 1;
 }
 
-async function ensureCredentialsForInitialization(workspaceFolder: vscode.WorkspaceFolder): Promise<boolean> {
-	const settings = vscode.workspace.getConfiguration('erpDashboardSync', workspaceFolder.uri);
+async function ensureCredentialsForInitialization(context: DashboardContext): Promise<boolean> {
+	const settings = vscode.workspace.getConfiguration('erpDashboardSync', context.uri);
 	const authMode = settings.get<AuthMode>('authMode', 'ntlm');
 	if (authMode !== 'ntlm') {
 		return true;
 	}
 
-	const authSettings = await resolveAuthSettings(workspaceFolder, settings);
+	const authSettings = await resolveAuthSettings(context, settings);
 	const hasUsername = authSettings.username.trim().length > 0;
 	const hasPassword = authSettings.password.length > 0;
 	if (hasUsername && hasPassword) {
@@ -292,8 +347,8 @@ async function ensureCredentialsForInitialization(workspaceFolder: vscode.Worksp
 		return false;
 	}
 
-	await setCredentialsInSecretStorage();
-	const refreshedAuthSettings = await resolveAuthSettings(workspaceFolder, settings);
+	await setCredentialsInSecretStorage(context);
+	const refreshedAuthSettings = await resolveAuthSettings(context, settings);
 	const hasCredentialsAfterPrompt =
 		refreshedAuthSettings.username.trim().length > 0 && refreshedAuthSettings.password.length > 0;
 	if (!hasCredentialsAfterPrompt) {
@@ -307,49 +362,53 @@ async function ensureCredentialsForInitialization(workspaceFolder: vscode.Worksp
 }
 
 async function triggerStartupReloadIfConfigured(): Promise<void> {
-	const workspaceFolder = getPrimaryWorkspaceFolder();
-	if (!workspaceFolder) {
-		return;
-	}
+	for (const context of await discoverDashboardContexts()) {
+		const settings = vscode.workspace.getConfiguration('erpDashboardSync', context.uri);
+		if (!settings.get<boolean>('reloadOnStartup', true)) {
+			continue;
+		}
 
-	const settings = vscode.workspace.getConfiguration('erpDashboardSync', workspaceFolder.uri);
-	if (!settings.get<boolean>('reloadOnStartup', true)) {
-		return;
-	}
+		const configFileName = settings.get<string>('configFileName', '.erp-dashboard-sync.json');
+		const localConfig = normalizeLocalConfig(await readJsonFile<LocalConfig>(vscode.Uri.joinPath(context.uri, configFileName)));
+		if (!localConfig?.dashboardId?.trim()) {
+			logOutput(`[StartupReload] Skip: Ungueltige Konfiguration (${context.uri.fsPath}).`);
+			continue;
+		}
 
-	const configFileName = settings.get<string>('configFileName', '.erp-dashboard-sync.json');
-	const localConfigUri = vscode.Uri.joinPath(workspaceFolder.uri, configFileName);
-	const localConfig = normalizeLocalConfig(await readJsonFile<LocalConfig>(localConfigUri));
-	if (!localConfig?.dashboardId?.trim()) {
-		return;
-	}
+		const workspaceLabel = getWorkspaceLabel(localConfig);
+		if (settings.get<boolean>('reloadOnStartupPrompt', true)) {
+			const answer = await vscode.window.showInformationMessage(
+				`ERP Dashboard Sync: ${getContextLabel(localConfig.contextType)} '${workspaceLabel}' (${context.uri.fsPath}) ist verknuepft. Aktuellen Stand aus ERP laden?`,
+				'Laden',
+				'Nicht jetzt'
+			);
+			if (answer !== 'Laden') {
+				continue;
+			}
+		}
 
-	const workspaceLabel = getWorkspaceLabel(localConfig);
-	const shouldPrompt = settings.get<boolean>('reloadOnStartupPrompt', true);
-	if (shouldPrompt) {
-		const answer = await vscode.window.showInformationMessage(
-			`ERP Dashboard Sync: ${getContextLabel(localConfig.contextType)} '${workspaceLabel}' ist verknuepft. Aktuellen Stand aus ERP laden?`,
-			'Laden',
-			'Nicht jetzt'
-		);
-
-		if (answer !== 'Laden') {
-			return;
+		logOutput(`[StartupReload] Starte Reload fuer '${workspaceLabel}' (${context.uri.fsPath}).`);
+		try {
+			await enqueueSyncOperation(() => initializeWorkspace(false, context));
+		} catch (error) {
+			logOutput(`[StartupReload] Kontext fehlgeschlagen, fahre mit weiteren Kontexten fort: ${formatError(error)}`);
 		}
 	}
-
-	logOutput(`[StartupReload] Starte Reload fuer ${getContextLabel(localConfig.contextType)} '${workspaceLabel}'.`);
-	await initializeWorkspace(false);
 }
 
-async function syncDocumentOnSave(document: vscode.TextDocument): Promise<void> {
-	const workspaceFolder = vscode.workspace.getWorkspaceFolder(document.uri);
+async function syncFile(uri: vscode.Uri, source: 'save' | 'filesystem'): Promise<void> {
+	const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
 	if (!workspaceFolder) {
-		logOutput(`[SaveSync] Skip: Datei ausserhalb Workspace gespeichert: ${document.uri.fsPath}`);
+		logOutput(`[SaveSync] Skip: Datei ausserhalb Workspace geaendert: ${uri.fsPath}`);
 		return;
 	}
 
-	const config = await loadRuntimeConfig(workspaceFolder, false);
+	const context = await findDashboardContext(uri);
+	if (!context) {
+		logOutput(`[SaveSync] Skip: Kein Dashboard-Kontext gefunden (${uri.fsPath}).`);
+		return;
+	}
+	const config = await loadRuntimeConfig(context, false);
 	if (!config) {
 		logOutput('[SaveSync] Skip: Keine gueltige lokale Konfiguration gefunden.');
 		return;
@@ -366,15 +425,7 @@ async function syncDocumentOnSave(document: vscode.TextDocument): Promise<void> 
 		return;
 	}
 
-	const managedLanguages = config.localConfig.contextType === 'flow' ? ['xml', 'javascript', 'sql'] : ['javascript', 'css', 'sql'];
-	if (!managedLanguages.includes(document.languageId)) {
-		logOutput(
-			`[SaveSync] Skip: Sprache '${document.languageId}' wird fuer ${config.localConfig.contextType} nicht synchronisiert.`
-		);
-		return;
-	}
-
-	const relativePath = toPosixPath(path.relative(workspaceFolder.uri.fsPath, document.uri.fsPath));
+	const relativePath = toPosixPath(path.relative(config.contextRoot.fsPath, uri.fsPath));
 	const pathMatch = findIndexEntryByRelativePath(
 		index,
 		relativePath,
@@ -398,7 +449,23 @@ async function syncDocumentOnSave(document: vscode.TextDocument): Promise<void> 
 		return;
 	}
 
-	logOutput(`[SaveSync] Trigger: ${relativePath} -> ${entry.table}.${entry.field}`);
+	let content: string;
+	try {
+		content = new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
+	} catch (error) {
+		if (error instanceof vscode.FileSystemError && error.code === 'FileNotFound') {
+			logOutput(`[SaveSync] Skip: Datei inzwischen geloescht (${relativePath}).`);
+			return;
+		}
+		throw error;
+	}
+	const contentHash = hashContent(content);
+	if ((synchronizedContentHashes.get(uri.toString()) ?? entry.contentHash) === contentHash) {
+		logOutput(`[SaveSync] Skip: Inhalt unveraendert (${relativePath}, Quelle=${source}).`);
+		return;
+	}
+
+	logOutput(`[SaveSync] Trigger (${source}): ${relativePath} -> ${entry.table}.${entry.field}`);
 
 	entry.contextType ??= config.localConfig.contextType;
 
@@ -408,13 +475,15 @@ async function syncDocumentOnSave(document: vscode.TextDocument): Promise<void> 
 	}
 
 	try {
-		const pushed = await pushUpdate(config, entry, document.getText());
+		const pushed = await pushUpdate(config, entry, content);
 		if (!pushed) {
 			vscode.window.setStatusBarMessage('ERP Sync: Update abgebrochen', 2500);
 			return;
 		}
+		synchronizedContentHashes.set(uri.toString(), contentHash);
 
 		try {
+			entry.contentHash = contentHash;
 			propagateVersionToSiblingEntries(index, entry);
 			await writeIndex(config, index);
 		} catch (writeError) {
@@ -488,19 +557,20 @@ function propagateVersionToSiblingEntries(index: FileIndex, entry: FileIndexEntr
 }
 
 async function loadRuntimeConfig(
-	workspaceFolder: vscode.WorkspaceFolder,
+	context: DashboardContext,
 	promptForDashboard: boolean
 ): Promise<RuntimeConfig | undefined> {
-	const settings = vscode.workspace.getConfiguration('erpDashboardSync', workspaceFolder.uri);
-	if (!deprecatedSettingsMigrationCompleted) {
+	const settings = vscode.workspace.getConfiguration('erpDashboardSync', context.uri);
+	const workspaceKey = context.workspaceFolder.uri.toString();
+	if (!migratedWorkspaceFolders.has(workspaceKey)) {
 		await migrateDeprecatedSettings(settings);
-		deprecatedSettingsMigrationCompleted = true;
+		migratedWorkspaceFolders.add(workspaceKey);
 	}
 
 	const configFileName = settings.get<string>('configFileName', '.erp-dashboard-sync.json');
-	const localConfigUri = vscode.Uri.joinPath(workspaceFolder.uri, configFileName);
+	const localConfigUri = vscode.Uri.joinPath(context.uri, configFileName);
 	let localConfig = normalizeLocalConfig(await readJsonFile<LocalConfig>(localConfigUri));
-	const authSettings = await resolveAuthSettings(workspaceFolder, settings);
+	const authSettings = await resolveAuthSettings(context, settings);
 	const authUsernameRaw = authSettings.username;
 	const authPassword = authSettings.password;
 	const authDomainRaw = authSettings.domain;
@@ -521,7 +591,8 @@ async function loadRuntimeConfig(
 	}
 
 	const runtimeConfig: RuntimeConfig = {
-		workspaceFolder,
+		workspaceFolder: context.workspaceFolder,
+		contextRoot: context.uri,
 		localConfigUri,
 		localConfig,
 		dbFetchJsonUrl: settings.get<string>(
@@ -716,6 +787,7 @@ function logAuthConfigurationDiagnostics(
 
 	logOutput('[Config] ERP Dashboard Sync runtime configuration loaded.');
 	logOutput(`[Config] Workspace folder: ${config.workspaceFolder.uri.fsPath}`);
+	logOutput(`[Config] Dashboard folder: ${config.contextRoot.fsPath}`);
 	logOutput(`[Config] authMode=${config.authMode}`);
 	logOutput(`[Config] authSource=${config.authSource}`);
 	logOutput(`[Config] verboseLogging=${config.verboseLogging ? 'yes' : 'no'}`);
@@ -747,10 +819,13 @@ function logAuthConfigurationDiagnostics(
 }
 
 async function resolveAuthSettings(
-	workspaceFolder: vscode.WorkspaceFolder,
+	context: DashboardContext,
 	settings: vscode.WorkspaceConfiguration
 ): Promise<StoredCredentials & { source: 'settings' | 'secretStorage' }> {
-	const stored = await readCredentialsFromSecretStorage(workspaceFolder, 'workspace');
+	const stored = await readCredentialsFromSecretStorage(context, 'workspace')
+		?? (context.uri.toString() !== context.workspaceFolder.uri.toString()
+			? await readCredentialsFromSecretStorage(context.workspaceFolder, 'workspace')
+			: undefined);
 	if (stored) {
 		return {
 			...stored,
@@ -758,7 +833,7 @@ async function resolveAuthSettings(
 		};
 	}
 
-	const storedGlobal = await readCredentialsFromSecretStorage(workspaceFolder, 'global');
+	const storedGlobal = await readCredentialsFromSecretStorage(context, 'global');
 	if (storedGlobal) {
 		return {
 			...storedGlobal,
@@ -774,10 +849,9 @@ async function resolveAuthSettings(
 	};
 }
 
-async function setCredentialsInSecretStorage(): Promise<void> {
-	const workspaceFolder = getPrimaryWorkspaceFolder();
-	if (!workspaceFolder) {
-		vscode.window.showErrorMessage('ERP Dashboard Sync: Bitte zuerst einen Workspace-Ordner oeffnen.');
+async function setCredentialsInSecretStorage(selectedContext?: DashboardContext): Promise<void> {
+	const context = selectedContext ?? (await selectDashboardContexts('credentials'))?.[0];
+	if (!context) {
 		return;
 	}
 
@@ -786,8 +860,8 @@ async function setCredentialsInSecretStorage(): Promise<void> {
 		return;
 	}
 
-	const settings = vscode.workspace.getConfiguration('erpDashboardSync', workspaceFolder.uri);
-	const current = await resolveAuthSettings(workspaceFolder, settings);
+	const settings = vscode.workspace.getConfiguration('erpDashboardSync', context.uri);
+	const current = await resolveAuthSettings(context, settings);
 
 	const username = await vscode.window.showInputBox({
 		title: 'ERP Dashboard Sync Credentials',
@@ -831,7 +905,7 @@ async function setCredentialsInSecretStorage(): Promise<void> {
 
 	const scopeChoice = await vscode.window.showQuickPick(
 		[
-			{ label: 'Nur in diesem Workspace speichern', value: 'workspace' as const },
+			{ label: 'Nur fuer diesen Dashboard-Ordner speichern', description: context.uri.fsPath, value: 'workspace' as const },
 			{ label: 'Global fuer alle Workspaces speichern', value: 'global' as const }
 		],
 		{
@@ -844,7 +918,7 @@ async function setCredentialsInSecretStorage(): Promise<void> {
 		return;
 	}
 
-	await writeCredentialsToSecretStorage(workspaceFolder, {
+	await writeCredentialsToSecretStorage(context, {
 		username: username.trim(),
 		password: passwordInput.length > 0 ? passwordInput : current.password,
 		domain: domain.trim()
@@ -853,14 +927,13 @@ async function setCredentialsInSecretStorage(): Promise<void> {
 	vscode.window.showInformationMessage(
 		scopeChoice.value === 'global'
 			? 'ERP Dashboard Sync: Credentials global im Secret Storage gespeichert.'
-			: 'ERP Dashboard Sync: Credentials fuer diesen Workspace im Secret Storage gespeichert.'
+			: `ERP Dashboard Sync: Credentials fuer '${context.uri.fsPath}' im Secret Storage gespeichert.`
 	);
 }
 
 async function clearCredentialsInSecretStorage(): Promise<void> {
-	const workspaceFolder = getPrimaryWorkspaceFolder();
-	if (!workspaceFolder) {
-		vscode.window.showErrorMessage('ERP Dashboard Sync: Bitte zuerst einen Workspace-Ordner oeffnen.');
+	const context = (await selectDashboardContexts('credentials'))?.[0];
+	if (!context) {
 		return;
 	}
 
@@ -871,7 +944,7 @@ async function clearCredentialsInSecretStorage(): Promise<void> {
 
 	const scopeChoice = await vscode.window.showQuickPick(
 		[
-			{ label: 'Credentials fuer diesen Workspace loeschen', value: 'workspace' as const },
+			{ label: 'Credentials fuer diesen Dashboard-Ordner loeschen', description: context.uri.fsPath, value: 'workspace' as const },
 			{ label: 'Globale Credentials loeschen', value: 'global' as const },
 			{ label: 'Beides loeschen', value: 'both' as const }
 		],
@@ -896,26 +969,28 @@ async function clearCredentialsInSecretStorage(): Promise<void> {
 	}
 
 	if (scopeChoice.value === 'workspace' || scopeChoice.value === 'both') {
-		await deleteCredentialsFromSecretStorage(workspaceFolder, 'workspace');
+		await deleteCredentialsFromSecretStorage(context, 'workspace');
 	}
 
 	if (scopeChoice.value === 'global' || scopeChoice.value === 'both') {
-		await deleteCredentialsFromSecretStorage(workspaceFolder, 'global');
+		await deleteCredentialsFromSecretStorage(context, 'global');
 	}
 
 	vscode.window.showInformationMessage('ERP Dashboard Sync: Gewaehlte Credentials wurden aus Secret Storage geloescht.');
 }
 
 async function resetVersionPromptState(): Promise<void> {
-	const workspaceFolder = getPrimaryWorkspaceFolder();
-	if (!workspaceFolder) {
-		vscode.window.showErrorMessage('ERP Dashboard Sync: Bitte zuerst einen Workspace-Ordner oeffnen.');
+	const context = (await selectDashboardContexts('reset'))?.[0];
+	if (!context) {
 		return;
 	}
+	await enqueueSyncOperation(() => resetContextVersionPromptState(context));
+}
 
-	const settings = vscode.workspace.getConfiguration('erpDashboardSync', workspaceFolder.uri);
+async function resetContextVersionPromptState(context: DashboardContext): Promise<void> {
+	const settings = vscode.workspace.getConfiguration('erpDashboardSync', context.uri);
 	const configFileName = settings.get<string>('configFileName', '.erp-dashboard-sync.json');
-	const localConfigUri = vscode.Uri.joinPath(workspaceFolder.uri, configFileName);
+	const localConfigUri = vscode.Uri.joinPath(context.uri, configFileName);
 	const localConfig = normalizeLocalConfig(await readJsonFile<LocalConfig>(localConfigUri));
 	if (!localConfig) {
 		vscode.window.showWarningMessage('ERP Dashboard Sync: Keine lokale Konfiguration gefunden.');
@@ -944,23 +1019,23 @@ async function resetVersionPromptState(): Promise<void> {
 	vscode.window.showInformationMessage('ERP Dashboard Sync: Versions-Prompt-States wurden zurueckgesetzt.');
 }
 
-function getSecretStorageKey(workspaceFolder: vscode.WorkspaceFolder, scope: CredentialScope): string {
+function getSecretStorageKey(context: { uri: vscode.Uri }, scope: CredentialScope): string {
 	if (scope === 'global') {
 		return `${SECRET_STORAGE_PREFIX}:credentials:global`;
 	}
 
-	return `${SECRET_STORAGE_PREFIX}:credentials:${workspaceFolder.uri.toString()}`;
+	return `${SECRET_STORAGE_PREFIX}:credentials:${context.uri.toString()}`;
 }
 
 async function readCredentialsFromSecretStorage(
-	workspaceFolder: vscode.WorkspaceFolder,
+	context: { uri: vscode.Uri },
 	scope: CredentialScope
 ): Promise<StoredCredentials | undefined> {
 	if (!extensionContext) {
 		return undefined;
 	}
 
-	const key = getSecretStorageKey(workspaceFolder, scope);
+	const key = getSecretStorageKey(context, scope);
 	const raw = await extensionContext.secrets.get(key);
 	if (!raw) {
 		return undefined;
@@ -980,7 +1055,7 @@ async function readCredentialsFromSecretStorage(
 }
 
 async function writeCredentialsToSecretStorage(
-	workspaceFolder: vscode.WorkspaceFolder,
+	context: { uri: vscode.Uri },
 	credentials: StoredCredentials,
 	scope: CredentialScope
 ): Promise<void> {
@@ -988,19 +1063,19 @@ async function writeCredentialsToSecretStorage(
 		throw new Error('Secret Storage ist nicht verfuegbar.');
 	}
 
-	const key = getSecretStorageKey(workspaceFolder, scope);
+	const key = getSecretStorageKey(context, scope);
 	await extensionContext.secrets.store(key, JSON.stringify(credentials));
 }
 
 async function deleteCredentialsFromSecretStorage(
-	workspaceFolder: vscode.WorkspaceFolder,
+	context: { uri: vscode.Uri },
 	scope: CredentialScope
 ): Promise<void> {
 	if (!extensionContext) {
 		return;
 	}
 
-	const key = getSecretStorageKey(workspaceFolder, scope);
+	const key = getSecretStorageKey(context, scope);
 	await extensionContext.secrets.delete(key);
 }
 
@@ -1164,7 +1239,7 @@ function logJsonErrorContext(input: string, error: unknown, stage: string): void
 async function materializeFiles(config: RuntimeConfig, rows: DbRow[]): Promise<FileIndex> {
 	const entries: FileIndexEntry[] = [];
 	const rootName = sanitizePathPart(config.localConfig.dashboardId);
-	const rootDir = vscode.Uri.joinPath(config.workspaceFolder.uri, config.generatedRootDir, rootName);
+	const rootDir = vscode.Uri.joinPath(config.contextRoot, config.generatedRootDir, rootName);
 	await vscode.workspace.fs.createDirectory(rootDir);
 
 	for (const row of rows) {
@@ -1202,14 +1277,15 @@ async function materializeQuickviewRow(
 	const jsRelativePath = toPosixPath(path.join(config.generatedRootDir, rootName, row.type.toLowerCase(), `${fileBaseName}.js`));
 	const cssRelativePath = toPosixPath(path.join(config.generatedRootDir, rootName, row.type.toLowerCase(), `${fileBaseName}.css`));
 
-	await writeTextFile(vscode.Uri.joinPath(recordDir, `${fileBaseName}.js`), row.jsPageScript ?? '');
-	await writeTextFile(vscode.Uri.joinPath(recordDir, `${fileBaseName}.css`), row.cssStyle ?? '');
+	await writeGeneratedFile(vscode.Uri.joinPath(recordDir, `${fileBaseName}.js`), row.jsPageScript ?? '');
+	await writeGeneratedFile(vscode.Uri.joinPath(recordDir, `${fileBaseName}.css`), row.cssStyle ?? '');
 	if (row.type === 'QUERY') {
-		await writeTextFile(vscode.Uri.joinPath(recordDir, `${fileBaseName}.sql`), row.statement ?? '');
+		await writeGeneratedFile(vscode.Uri.joinPath(recordDir, `${fileBaseName}.sql`), row.statement ?? '');
 	}
 
 	entries.push({
 		relativePath: jsRelativePath,
+		contentHash: hashContent(row.jsPageScript ?? ''),
 		table: row.type === 'QUERY' ? 'QVQUERY' : 'QVDASHBOARD',
 		field: 'JSPAGESCRIPT',
 		versionField: row.type === 'QUERY' ? 'VERSION' : 'ANP_VERSION',
@@ -1222,6 +1298,7 @@ async function materializeQuickviewRow(
 
 	entries.push({
 		relativePath: cssRelativePath,
+		contentHash: hashContent(row.cssStyle ?? ''),
 		table: row.type === 'QUERY' ? 'QVQUERY' : 'QVDASHBOARD',
 		field: 'CSSSTYLE',
 		versionField: row.type === 'QUERY' ? 'VERSION' : 'ANP_VERSION',
@@ -1236,6 +1313,7 @@ async function materializeQuickviewRow(
 		const sqlRelativePath = toPosixPath(path.join(config.generatedRootDir, rootName, row.type.toLowerCase(), `${fileBaseName}.sql`));
 		entries.push({
 			relativePath: sqlRelativePath,
+			contentHash: hashContent(row.statement ?? ''),
 			table: 'QVQUERY',
 			field: 'STATEMENT',
 			versionField: 'VERSION',
@@ -1263,13 +1341,14 @@ async function materializeFlowRow(
 	const jsRelativePath = toPosixPath(path.join(config.generatedRootDir, rootName, fileBaseName, `${fileBaseName}.js`));
 	const sqlRelativePath = toPosixPath(path.join(config.generatedRootDir, rootName, fileBaseName, `${fileBaseName}.sql`));
 
-	await writeTextFile(vscode.Uri.joinPath(flowRecordDir, `${fileBaseName}.xml`), row.xmlDefinition ?? '');
-	await writeTextFile(vscode.Uri.joinPath(flowRecordDir, `${fileBaseName}.js`), row.javascript ?? '');
-	await writeTextFile(vscode.Uri.joinPath(flowRecordDir, `${fileBaseName}.sql`), row.sqlStatement ?? '');
+	await writeGeneratedFile(vscode.Uri.joinPath(flowRecordDir, `${fileBaseName}.xml`), row.xmlDefinition ?? '');
+	await writeGeneratedFile(vscode.Uri.joinPath(flowRecordDir, `${fileBaseName}.js`), row.javascript ?? '');
+	await writeGeneratedFile(vscode.Uri.joinPath(flowRecordDir, `${fileBaseName}.sql`), row.sqlStatement ?? '');
 
 	const recordName = row.title.trim().length > 0 ? `${row.title.trim()} (${row.guid})` : row.guid;
 	entries.push({
 		relativePath: xmlRelativePath,
+		contentHash: hashContent(row.xmlDefinition ?? ''),
 		table: 'FLOWBOARD',
 		field: 'XMLDEFINITION',
 		guid: row.guid,
@@ -1280,6 +1359,7 @@ async function materializeFlowRow(
 	});
 	entries.push({
 		relativePath: jsRelativePath,
+		contentHash: hashContent(row.javascript ?? ''),
 		table: 'FLOWBOARD',
 		field: 'JAVASCRIPT',
 		guid: row.guid,
@@ -1290,6 +1370,7 @@ async function materializeFlowRow(
 	});
 	entries.push({
 		relativePath: sqlRelativePath,
+		contentHash: hashContent(row.sqlStatement ?? ''),
 		table: 'FLOWBOARD',
 		field: 'SQLSTATEMENT',
 		guid: row.guid,
@@ -1301,12 +1382,12 @@ async function materializeFlowRow(
 }
 
 async function writeIndex(config: RuntimeConfig, index: FileIndex): Promise<void> {
-	const indexUri = vscode.Uri.joinPath(config.workspaceFolder.uri, config.indexFileName);
+	const indexUri = vscode.Uri.joinPath(config.contextRoot, config.indexFileName);
 	await writeJsonFile(indexUri, index);
 }
 
 async function readIndex(config: RuntimeConfig): Promise<FileIndex | undefined> {
-	const indexUri = vscode.Uri.joinPath(config.workspaceFolder.uri, config.indexFileName);
+	const indexUri = vscode.Uri.joinPath(config.contextRoot, config.indexFileName);
 	return readJsonFile<FileIndex>(indexUri);
 }
 
@@ -2185,13 +2266,162 @@ function escapeXml(value: string): string {
 		.replace(/'/g, '&apos;');
 }
 
-function getPrimaryWorkspaceFolder(): vscode.WorkspaceFolder | undefined {
+function containsUri(root: vscode.Uri, uri: vscode.Uri): boolean {
+	if (root.scheme !== uri.scheme || root.authority !== uri.authority) {
+		return false;
+	}
+	const relativePath = path.relative(root.fsPath, uri.fsPath);
+	return relativePath === '' || (relativePath !== '..'
+		&& !relativePath.startsWith(`..${path.sep}`) && !path.isAbsolute(relativePath));
+}
+
+function contextKey(uri: vscode.Uri): string {
+	const key = uri.toString();
+	return process.platform === 'win32' ? key.toLowerCase() : key;
+}
+
+async function hasContextConfig(context: DashboardContext): Promise<boolean> {
+	const settings = vscode.workspace.getConfiguration('erpDashboardSync', context.uri);
+	const configFileName = settings.get<string>('configFileName', '.erp-dashboard-sync.json');
+	try {
+		const stat = await vscode.workspace.fs.stat(vscode.Uri.joinPath(context.uri, configFileName));
+		return (stat.type & vscode.FileType.File) !== 0;
+	} catch (error) {
+		if (error instanceof vscode.FileSystemError && error.code === 'FileNotFound') {
+			return false;
+		}
+		throw error;
+	}
+}
+
+async function findDashboardContext(uri: vscode.Uri): Promise<DashboardContext | undefined> {
+	const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
+	if (!workspaceFolder) {
+		return undefined;
+	}
+	let directory = vscode.Uri.joinPath(uri, '..');
+	while (containsUri(workspaceFolder.uri, directory)) {
+		const context = { uri: directory, workspaceFolder };
+		if (await hasContextConfig(context)) {
+			return context;
+		}
+		if (contextKey(directory) === contextKey(workspaceFolder.uri)) {
+			break;
+		}
+		directory = vscode.Uri.joinPath(directory, '..');
+	}
+	return undefined;
+}
+
+async function discoverDashboardContexts(): Promise<DashboardContext[]> {
+	const contexts = new Map<string, DashboardContext>();
+	for (const workspaceFolder of vscode.workspace.workspaceFolders ?? []) {
+		const settings = vscode.workspace.getConfiguration('erpDashboardSync', workspaceFolder.uri);
+		const configFileName = toPosixPath(settings.get<string>('configFileName', '.erp-dashboard-sync.json'));
+		const configFiles = await vscode.workspace.findFiles(
+			new vscode.RelativePattern(workspaceFolder, `**/${configFileName}`),
+			'**/{node_modules,.git}/**'
+		);
+		for (const configFile of configFiles) {
+			let uri = configFile;
+			for (const _part of configFileName.split('/').filter(Boolean)) {
+				uri = vscode.Uri.joinPath(uri, '..');
+			}
+			const owner = vscode.workspace.getWorkspaceFolder(uri);
+			if (owner) {
+				const ownerSettings = vscode.workspace.getConfiguration('erpDashboardSync', uri);
+				const ownerFileName = ownerSettings.get<string>('configFileName', '.erp-dashboard-sync.json');
+				if (contextKey(vscode.Uri.joinPath(uri, ownerFileName)) === contextKey(configFile)) {
+					contexts.set(contextKey(uri), { uri, workspaceFolder: owner });
+				}
+			}
+		}
+	}
+	return [...contexts.values()].sort((left, right) => left.uri.fsPath.localeCompare(right.uri.fsPath));
+}
+
+type ContextCommand = 'initialize' | 'reload' | 'credentials' | 'reset';
+interface ContextPickItem extends vscode.QuickPickItem {
+	contexts?: DashboardContext[];
+	chooseFolder?: boolean;
+}
+
+async function selectDashboardContexts(command: ContextCommand): Promise<DashboardContext[] | undefined> {
 	const folders = vscode.workspace.workspaceFolders;
-	if (!folders || folders.length === 0) {
+	if (!folders?.length) {
+		vscode.window.showErrorMessage('ERP Dashboard Sync: Bitte zuerst einen Workspace-Ordner oeffnen.');
 		return undefined;
 	}
 
-	return folders[0];
+	const discovered = await discoverDashboardContexts();
+	const candidates = new Map(discovered.map((context) => [contextKey(context.uri), context]));
+	if (command === 'initialize' || command === 'credentials') {
+		for (const workspaceFolder of folders) {
+			candidates.set(contextKey(workspaceFolder.uri), { uri: workspaceFolder.uri, workspaceFolder });
+		}
+	}
+	const contexts = [...candidates.values()];
+	if (!contexts.length) {
+		vscode.window.showWarningMessage('ERP Dashboard Sync: Keine lokale Konfiguration gefunden. Bitte zuerst "Initialize Workspace" ausfuehren.');
+		return undefined;
+	}
+	if (contexts.length === 1 && command !== 'initialize') {
+		return contexts;
+	}
+
+	const items: ContextPickItem[] = await Promise.all(contexts.map(async (context) => {
+		const settings = vscode.workspace.getConfiguration('erpDashboardSync', context.uri);
+		const configFileName = settings.get<string>('configFileName', '.erp-dashboard-sync.json');
+		const localConfig = normalizeLocalConfig(await readJsonFile<LocalConfig>(vscode.Uri.joinPath(context.uri, configFileName)));
+		return {
+			label: localConfig?.dashboardId ? `${getContextLabel(localConfig.contextType)}: ${getWorkspaceLabel(localConfig)}` : path.basename(context.uri.fsPath),
+			description: context.uri.fsPath,
+			contexts: [context]
+		};
+	}));
+	if (command === 'reload' && contexts.length > 1) {
+		items.unshift({ label: 'Alle Dashboards neu laden', contexts });
+	}
+	if (command === 'initialize') {
+		items.push({ label: 'Anderen Dashboard-Ordner waehlen...', chooseFolder: true });
+	}
+	const choice = await vscode.window.showQuickPick(items, {
+		title: 'ERP Dashboard Sync: Dashboard-Ordner',
+		placeHolder: 'Fuer welchen Dashboard-Ordner soll der Befehl ausgefuehrt werden?'
+	});
+	if (!choice?.chooseFolder) {
+		return choice?.contexts;
+	}
+	const selected = await vscode.window.showOpenDialog({
+		title: 'Dashboard-Ordner im Workspace waehlen',
+		canSelectFolders: true,
+		canSelectFiles: false,
+		canSelectMany: false,
+		defaultUri: folders[0]?.uri
+	});
+	const uri = selected?.[0];
+	if (!uri) {
+		return undefined;
+	}
+	const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri);
+	if (!workspaceFolder) {
+		vscode.window.showErrorMessage('ERP Dashboard Sync: Der Dashboard-Ordner muss innerhalb eines geoeffneten Workspace-Ordners liegen.');
+		return undefined;
+	}
+	return [{ uri, workspaceFolder }];
+}
+
+async function reloadContexts(contexts: DashboardContext[]): Promise<void> {
+	const results = await Promise.allSettled(contexts.map((context) =>
+		enqueueSyncOperation(() => initializeWorkspace(false, context))));
+	const failures = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+	const firstFailure = failures[0];
+	if (failures.length === 1 && firstFailure) {
+		throw firstFailure.reason;
+	}
+	if (failures.length > 1) {
+		throw new AggregateError(failures.map((failure) => failure.reason), 'ERP Dashboard Sync: Mehrere Reloads fehlgeschlagen.');
+	}
 }
 
 async function readJsonFile<T>(uri: vscode.Uri): Promise<T | undefined> {
@@ -2212,6 +2442,12 @@ async function writeJsonFile(uri: vscode.Uri, value: unknown): Promise<void> {
 async function writeTextFile(uri: vscode.Uri, content: string): Promise<void> {
 	const bytes = new TextEncoder().encode(content);
 	await vscode.workspace.fs.writeFile(uri, bytes);
+}
+
+async function writeGeneratedFile(uri: vscode.Uri, content: string): Promise<void> {
+	await writeTextFile(uri, content);
+	// Also suppress reload feedback if a later file or the index cannot be written.
+	synchronizedContentHashes.set(uri.toString(), hashContent(content));
 }
 
 function formatError(error: unknown): string {

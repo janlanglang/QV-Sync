@@ -4,16 +4,16 @@ VS Code extension to synchronize APplus Quickview and Flowboard sources with loc
 
 ## What It Does
 
-- Initializes one workspace for one context type:
+- Supports multiple independent dashboard folders in a single-folder or multi-root workspace:
   - Quickview by dashboard name (for example `wss_001`)
   - Flow by GUID
 - Loads data via `dbFetchJSON` and generates local files:
   - Quickview: `.js`, `.css`, and for query rows `.sql`
   - Flow: `.xml`, `.js`, `.sql`
 - Writes a local index file mapping each generated file to ERP table/field/GUID.
-- On save, writes changed content back via SOAP `xmlUpdateOffline`.
+- On editor save or external file changes, writes changed content back via SOAP `xmlUpdateOffline`.
 - Handles version updates with context-specific logic (Quickview and Flow).
-- Optional startup reload: if a workspace is already linked, the extension can ask once and reload latest ERP state.
+- Optional startup reload: for each linked dashboard folder, the extension can ask and reload latest ERP state.
 
 ## Generated Workspace Files
 
@@ -55,20 +55,48 @@ VS Code extension to synchronize APplus Quickview and Flowboard sources with loc
 Hinweis:
 - Fuer einen spaeteren manuellen Komplettabgleich: `ERP Dashboard Sync: Reload From ERP`.
 
+## Multiple Dashboards
+
+Existing dashboard folders can be used without running Initialize Workspace again:
+
+```text
+parent-folder
+  dashboard-a
+    .erp-dashboard-sync.json
+    .erp-dashboard-sync-index.json
+    erp-dashboard
+  dashboard-b
+    .erp-dashboard-sync.json
+    .erp-dashboard-sync-index.json
+    erp-dashboard
+```
+
+- Open `parent-folder`, or add `dashboard-a` and `dashboard-b` as separate folders to a multi-root workspace.
+- The extension discovers each existing sync configuration, including nested dashboard folders. Configuration discovery excludes `node_modules` and `.git`.
+- Existing indexes are reused in place. Index paths remain relative to their original dashboard folder, not the parent workspace. No migration or regeneration is needed just to combine workspaces.
+- For uploads, the nearest ancestor dashboard configuration within the containing workspace folder determines the context. A missing index, invalid configuration, or unindexed file in that context never falls back to another dashboard's index.
+- For commands, choose the dashboard folder when multiple targets exist. Reload From ERP additionally offers **Alle Dashboards neu laden**. A failed reload does not prevent other selected dashboards from being processed.
+- Initialize Workspace offers existing dashboard/workspace folders and **Anderen Dashboard-Ordner waehlen...** to initialize a new folder inside the workspace. Do not initialize existing dashboards just to include them in a parent workspace.
+- Startup reload checks every discovered context independently, using its effective startup settings. Declining one prompt does not skip the other contexts.
+- Configuration, generated files, index updates and version decisions stay in their respective dashboard folder.
+- Set/Clear Credentials and Reset Version Prompt State also select the target folder. Existing Secret Storage credentials remain usable when the dashboard folder stays at the same absolute location.
+- VS Code extension settings support per-folder overrides in multi-root workspaces. With only a parent folder open, nested dashboards inherit that workspace folder's settings: VS Code does not load nested `.vscode/settings.json` or settings from nested `.code-workspace` files. Add the actual dashboard directories as workspace roots to retain separate folder settings; transfer settings from old standalone workspace files into folder settings or the parent workspace as appropriate.
+
 ## Commands
 - Extension updaten (VSIX installieren) und VS Code neu laden.
 - Command Palette oeffnen: Strg+Shift+P.
 
 - `ERP Dashboard Sync: Initialize Workspace`
-	- Fragt zuerst den Typ (`Quickview` oder `Flow`), dann den Identifier.
+	- Waehlt den Dashboard-Ordner, fragt dann Typ (`Quickview` oder `Flow`) und Identifier.
 	- Speichert lokale Konfiguration.
 	- Laedt ERP-Daten und erzeugt Arbeitsdateien.
 - `ERP Dashboard Sync: Reload From ERP`
 	- Verwendet bestehende Konfiguration und laedt alle generierten Dateien neu.
+	- Bei mehreren Kontexten: Dashboard-Auswahl oder alle Dashboards neu laden.
 	- Sinnvoll als manueller Refresh bei Aenderungen direkt in ERP.
 - `ERP Dashboard Sync: Set Credentials (Secret Storage)`
   - Speichert NTLM username/password/domain sicher im VS Code Secret Storage.
-  - Optional als Workspace-Credentials oder global fuer alle Workspaces.
+  - Optional fuer den ausgewaehlten Dashboard-Ordner oder global fuer alle Workspaces.
 - `ERP Dashboard Sync: Clear Credentials (Secret Storage)`
   - Entfernt gespeicherte Credentials aus VS Code Secret Storage.
 - `ERP Dashboard Sync: Reset Version Prompt State`
@@ -89,6 +117,17 @@ Hinweis:
 - `erpDashboardSync.configFileName`
 - `erpDashboardSync.indexFileName`
 - `erpDashboardSync.generatedRootDir`
+
+### Automatic Uploads
+
+- `autoSyncOnSave` controls both editor saves and external filesystem changes (for example AI tools).
+- Only files mapped in the local index are uploaded; the editor language mode is irrelevant.
+- Changes are debounced for 300 ms per file. Uploads and ERP reloads run sequentially to protect shared index/version state.
+- The saved file content is uploaded, never unsaved editor changes. Further changes during an upload are queued.
+- A SHA-256 content hash in the index prevents duplicate uploads and uploads of unchanged files generated by an ERP reload.
+- Existing indexes without hashes remain supported; the first subsequent change/save uploads the file and records its hash.
+- No offline/startup catch-up scan is performed. Changes made while VS Code is closed are not automatically uploaded.
+- A failed or cancelled upload does not mark the content as synchronized. Save again to retry; inspect `ERP Dashboard Sync` in the Output panel for triggers, skips and failures.
 
 ### Logging
 
@@ -139,7 +178,7 @@ Hinweis:
 
 ## Startup Auto Reload
 
-- `erpDashboardSync.reloadOnStartup = true` (default): when a linked dashboard exists in `.erp-dashboard-sync.json`, startup reload is enabled.
+- `erpDashboardSync.reloadOnStartup = true` (default): startup reload is enabled for every discovered dashboard configuration.
 - `erpDashboardSync.reloadOnStartupPrompt = true` (default): show a short prompt (`Laden` / `Nicht jetzt`) before startup reload.
 - Set `reloadOnStartupPrompt = false` for fully automatic reload on startup.
 
@@ -154,8 +193,10 @@ For environments where Postman requires NTLM, configure:
 
 Credential precedence:
 
-1. Secret Storage credentials (recommended)
-2. Plain settings (`authUsername` / `authPassword` / `authDomain`) as fallback
+1. Dashboard-folder Secret Storage credentials (recommended; existing standalone-folder keys are preserved)
+2. Containing workspace-folder Secret Storage credentials, if the dashboard is nested and has no own credentials
+3. Global Secret Storage credentials
+4. Plain settings (`authUsername` / `authPassword` / `authDomain`) as fallback
 
 ### Pflichtfelder fuer den Betrieb
 
@@ -175,6 +216,7 @@ Credential precedence:
 - Compile: `npm run compile`
 - Watch: `npm run watch`
 - Lint: `npm run lint`
+- Focused sync/context regression tests after compile: `node_modules\.bin\mocha --ui tdd --timeout 10000 out\test\fileSync.test.js`
 
 ## Build VSIX / Distribution
 

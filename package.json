@@ -2,7 +2,7 @@
   "name": "erp-dashboard-sync",
   "displayName": "ERP Dashboard Sync",
   "description": "Sync JS/CSS files between VS Code workspace and APplus ERP dashboard",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "vscode": "^1.118.0"
@@ -55,26 +55,31 @@
       "title": "ERP Dashboard Sync",
       "properties": {
         "erpDashboardSync.dbFetchJsonUrl": {
+          "scope": "resource",
           "type": "string",
           "default": "https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/customutils.asmx/dbFetchJSON",
           "description": "ERP endpoint for dbFetchJSON. SQL is appended as query parameter 'sql'."
         },
         "erpDashboardSync.xmlUpdateOfflineSoapUrl": {
+          "scope": "resource",
           "type": "string",
           "default": "https://applusdeploy.systec-lab.local/APplusdeploy/flexmobility/utils.asmx/xmlUpdateOffline",
           "description": "ERP SOAP endpoint for xmlUpdateOffline (SOAP 1.2). Both .../utils.asmx and .../utils.asmx/xmlUpdateOffline are supported."
         },
         "erpDashboardSync.verboseLogging": {
+          "scope": "resource",
           "type": "boolean",
           "default": false,
           "description": "Write verbose debug logs to the output channel, including SQL statements, SOAP payloads and raw ERP responses. Keep disabled for normal use."
         },
         "erpDashboardSync.tlsAllowInsecure": {
+          "scope": "resource",
           "type": "boolean",
           "default": false,
           "description": "Allow HTTPS connections with invalid/self-signed certificates. Use only in trusted internal environments."
         },
         "erpDashboardSync.authMode": {
+          "scope": "resource",
           "type": "string",
           "enum": [
             "none",
@@ -84,46 +89,55 @@
           "description": "Authentication mode used for ERP requests."
         },
         "erpDashboardSync.authUsername": {
+          "scope": "resource",
           "type": "string",
           "default": "",
           "description": "Username for NTLM authentication (fallback, if no Secret Storage credentials exist)."
         },
         "erpDashboardSync.authPassword": {
+          "scope": "resource",
           "type": "string",
           "default": "",
           "description": "Password fallback for NTLM authentication. Prefer command 'Set Credentials (Secret Storage)' instead of plaintext settings."
         },
         "erpDashboardSync.authDomain": {
+          "scope": "resource",
           "type": "string",
           "default": "",
           "description": "Domain for NTLM authentication (fallback, if no Secret Storage credentials exist)."
         },
         "erpDashboardSync.autoSyncOnSave": {
+          "scope": "resource",
           "type": "boolean",
           "default": true,
-          "description": "Automatically write managed JS/CSS changes back to ERP on file save."
+          "description": "Automatically write changes to indexed JS/CSS/SQL/XML files back to ERP on editor save or external filesystem changes."
         },
         "erpDashboardSync.reloadOnStartup": {
+          "scope": "resource",
           "type": "boolean",
           "default": true,
           "description": "If a dashboard is already linked in the workspace, offer or perform a reload from ERP when VS Code starts."
         },
         "erpDashboardSync.reloadOnStartupPrompt": {
+          "scope": "resource",
           "type": "boolean",
           "default": true,
           "description": "Show a short confirmation before the startup reload. If disabled, the reload runs automatically."
         },
         "erpDashboardSync.configFileName": {
+          "scope": "resource",
           "type": "string",
           "default": ".erp-dashboard-sync.json",
           "description": "Workspace file storing the context type, workspace identifier, optional Flow title and Flow version state."
         },
         "erpDashboardSync.indexFileName": {
+          "scope": "resource",
           "type": "string",
           "default": ".erp-dashboard-sync-index.json",
           "description": "Workspace file mapping generated files to ERP rows and fields for Quickview and Flow."
         },
         "erpDashboardSync.generatedRootDir": {
+          "scope": "resource",
           "type": "string",
           "default": "erp-dashboard",
           "description": "Folder where generated Quickview and Flow workspace files are stored."
