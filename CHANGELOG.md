@@ -8,6 +8,10 @@ Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how 
 
 - No changes yet.
 
+## [1.1.0] - 2026-11-19
+
+- Rename managed Query and Dashboard files on reload when their ERP names change, using GUIDs to preserve their identity.
+
 ## [1.0.0] - 2026-11-18
 
 - Bundle a Copilot Chat skill with detailed Quickview, Flow, ERP sync, data-service, documentation, and anonymized example references for safely editing materialized files.

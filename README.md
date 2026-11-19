@@ -144,6 +144,7 @@ Nach einer Aktualisierung die neue VSIX installieren und VS Code neu laden. Die 
   - Lädt ERP-Daten und erzeugt Arbeitsdateien.
 - `ERP Dashboard Sync: Reload From ERP`
   - Verwendet die bestehende Konfiguration und lädt alle erzeugten Dateien neu.
+  - Erkennt umbenannte Queries und Dashboards anhand ihrer GUID, benennt die verwalteten Dateien entsprechend um und entfernt die alten Dateipfade.
   - Bietet bei mehreren Kontexten eine Dashboard-Auswahl oder das Laden aller Dashboards an.
   - Dient dem manuellen Abgleich nach Änderungen direkt im ERP.
 - `ERP Dashboard Sync: Set Credentials (Secret Storage)`

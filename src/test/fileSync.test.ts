@@ -200,6 +200,9 @@ function createHarness(options: {
 					files.set(uri.fsPath, bytes);
 					if (/\.(js|css|sql|xml|txt)$/.test(uri.fsPath)) { change.fire(uri); }
 				},
+				delete: async (uri: TestUri) => {
+					if (!files.delete(uri.fsPath)) { throw new TestFileSystemError(`Missing file: ${uri.fsPath}`); }
+				},
 				createDirectory: async () => {}
 			}
 		},
@@ -707,6 +710,42 @@ suite('Dashboard-query fields', () => {
 		}
 		assert.ok(entries.some((entry) => entry.guid === 'assignment-b' && entry.field === 'JSCHARTSCRIPT'
 			&& entry.contentHash === hash('')));
+		assert.deepStrictEqual(h.errors, []);
+	});
+
+	test('renames generated files when query or dashboard names change and reloads by dashboard GUID', async () => {
+		await h.reload();
+		const previousEntries = h.index().entries;
+		const previousPaths = previousEntries.map((entry) => entry.relativePath);
+		h.setRows(async (sql, rows) => {
+			assert.ok(sql.includes("QVDASHBOARD.GUID = 'guid-dashboard'"));
+			return rows.map((row) => row.type === 'QUERY'
+				? {
+					...row, qvquery: 'renamed-query', DASHBOARDQUERY_GUID: 'assignment-guid',
+					PARAMSTRING: '', JSCHARTSCRIPT: '', CHARTOPTIONS: ''
+				}
+				: { ...row, qvdashboard: 'renamed-dashboard' });
+		});
+
+		await h.reload();
+
+		const currentEntries = h.index().entries;
+		const currentPaths = new Set(currentEntries.map((entry) => entry.relativePath));
+		assert.strictEqual(h.json(h.configUri).dashboardId, 'renamed-dashboard');
+		assert.ok(currentEntries.some((entry) => entry.relativePath.includes('renamed-query__guid.js')));
+		assert.ok(currentEntries.some((entry) => entry.relativePath.includes('renamed-dashboard__guid-dashboard.js')));
+		assert.ok(currentEntries.filter((entry) => entry.table === 'QVDASHBOARDQUERY')
+			.every((entry) => entry.relativePath.includes('renamed-query__assignment-guid.')));
+		for (const entry of previousEntries) {
+			const renamed = currentEntries.some((candidate) =>
+				candidate.table === entry.table && candidate.guid === entry.guid && candidate.field === entry.field
+				&& candidate.relativePath !== entry.relativePath);
+			if (renamed && !currentPaths.has(entry.relativePath)) {
+				const oldUri = TestUri.joinPath(h.root, ...entry.relativePath.split('/'));
+				assert.ok(!h.files.has(oldUri.fsPath), `Old generated file remains: ${entry.relativePath}`);
+			}
+		}
+		assert.strictEqual(previousPaths.length, 6);
 		assert.deepStrictEqual(h.errors, []);
 	});
 

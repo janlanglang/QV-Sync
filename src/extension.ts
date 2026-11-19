@@ -262,7 +262,19 @@ async function initializeWorkspace(promptForDashboard: boolean, context: Dashboa
 			}
 
 			progress.report({ message: 'Daten via dbFetchJSON abrufen...' });
-			const rows = await fetchWorkspaceRows(config);
+			const previousIndex = await readIndex(config);
+			const linkedDashboardGuid = getIndexedDashboardGuid(previousIndex, config.localConfig.dashboardId);
+			const rows = await fetchWorkspaceRows(config, previousIndex);
+			if (config.localConfig.contextType === 'quickview') {
+				const dashboards = rows.filter((row) => row.type === 'DASHBOARD');
+				if (linkedDashboardGuid && dashboards.length === 1 && dashboards[0]?.guid === linkedDashboardGuid
+					&& dashboards[0].name !== config.localConfig.dashboardId) {
+					const previousName = config.localConfig.dashboardId;
+					config.localConfig.dashboardId = dashboards[0].name;
+					await writeJsonFile(config.localConfigUri, config.localConfig);
+					logOutput(`[Reload] Dashboard umbenannt: '${previousName}' -> '${config.localConfig.dashboardId}'`);
+				}
+			}
 			if (config.localConfig.contextType === 'flow') {
 				await persistFlowDisplayName(config, rows[0]?.title);
 			}
@@ -272,6 +284,7 @@ async function initializeWorkspace(promptForDashboard: boolean, context: Dashboa
 
 			progress.report({ message: 'Index schreiben...' });
 			await writeIndex(config, index);
+			await removeRenamedGeneratedFiles(config, previousIndex, index);
 
 			vscode.window.showInformationMessage(
 				`ERP Dashboard Sync: ${rows.length} Elemente fuer ${getContextLabel(config.localConfig.contextType)} '${getWorkspaceLabel(config.localConfig)}' geladen.`
@@ -1098,21 +1111,23 @@ async function deleteCredentialsFromSecretStorage(
 	await extensionContext.secrets.delete(key);
 }
 
-async function fetchWorkspaceRows(config: RuntimeConfig): Promise<DbRow[]> {
+async function fetchWorkspaceRows(config: RuntimeConfig, index?: FileIndex): Promise<DbRow[]> {
 	if (config.localConfig.contextType === 'flow') {
 		return fetchFlowRows(config);
 	}
 
-	return fetchQuickviewRows(config);
+	return fetchQuickviewRows(config, index);
 }
 
-async function fetchQuickviewRows(config: RuntimeConfig): Promise<DbRow[]> {
+async function fetchQuickviewRows(config: RuntimeConfig, index?: FileIndex): Promise<DbRow[]> {
+	const dashboardGuid = getIndexedDashboardGuid(index, config.localConfig.dashboardId);
+
 	const executeFetch = async (includeAnpVersion: boolean): Promise<string> => {
-		const sql = buildQuickviewSql(config.localConfig.dashboardId, includeAnpVersion);
+		const sql = buildQuickviewSql(config.localConfig.dashboardId, includeAnpVersion, dashboardGuid);
 		const fetchUrl = new URL(config.dbFetchJsonUrl);
 		fetchUrl.searchParams.set('sql', sql);
 		logOutput(
-			`[DBFetch] Quickview request: dashboard=${config.localConfig.dashboardId}, mode=${includeAnpVersion ? 'with ANP_VERSION' : 'without ANP_VERSION (fallback)'}, endpoint=${config.dbFetchJsonUrl}, sqlLength=${sql.length}`
+			`[DBFetch] Quickview request: dashboard=${config.localConfig.dashboardId}${dashboardGuid ? `, GUID=${dashboardGuid}` : ''}, mode=${includeAnpVersion ? 'with ANP_VERSION' : 'without ANP_VERSION (fallback)'}, endpoint=${config.dbFetchJsonUrl}, sqlLength=${sql.length}`
 		);
 		logVerbose(config, `[DBFetch] Request URL (encoded): ${fetchUrl.toString()}`);
 		logVerbose(config, `[DBFetch] SQL (decoded):\n${sql}`);
@@ -1139,6 +1154,17 @@ async function fetchQuickviewRows(config: RuntimeConfig): Promise<DbRow[]> {
 	}
 
 	return parseWorkspaceRows(responseText, config, 'quickview');
+}
+
+function getIndexedDashboardGuid(index: FileIndex | undefined, dashboardId: string): string | undefined {
+	if (index?.dashboardId !== dashboardId) {
+		return undefined;
+	}
+
+	const dashboardGuids = new Set(index.entries
+		.filter((entry) => entry.table === 'QVDASHBOARD' && entry.type === 'DASHBOARD')
+		.map((entry) => entry.guid));
+	return dashboardGuids.size === 1 ? dashboardGuids.values().next().value : undefined;
 }
 
 async function fetchFlowRows(config: RuntimeConfig): Promise<DbRow[]> {
@@ -1275,6 +1301,59 @@ async function materializeFiles(config: RuntimeConfig, rows: DbRow[]): Promise<F
 		dashboardId: config.localConfig.dashboardId,
 		entries
 	};
+}
+
+async function removeRenamedGeneratedFiles(
+	config: RuntimeConfig,
+	previousIndex: FileIndex | undefined,
+	currentIndex: FileIndex
+): Promise<void> {
+	if (!previousIndex) {
+		return;
+	}
+
+	const currentPaths = new Set(currentIndex.entries.map((entry) => entry.relativePath));
+	const currentEntriesByIdentity = new Map<string, Set<string>>();
+	for (const entry of currentIndex.entries) {
+		const identity = `${entry.table}\0${entry.guid}\0${entry.field}`;
+		const paths = currentEntriesByIdentity.get(identity) ?? new Set<string>();
+		paths.add(entry.relativePath);
+		currentEntriesByIdentity.set(identity, paths);
+	}
+
+	const generatedRoot = vscode.Uri.joinPath(config.contextRoot, config.generatedRootDir);
+	const oldPaths = new Set<string>();
+	for (const entry of previousIndex.entries) {
+		const identity = `${entry.table}\0${entry.guid}\0${entry.field}`;
+		const currentPathsForIdentity = currentEntriesByIdentity.get(identity);
+		if (!currentPathsForIdentity || currentPathsForIdentity.size !== 1) {
+			continue;
+		}
+
+		const currentPath = currentPathsForIdentity.values().next().value;
+		if (!currentPath || currentPath === entry.relativePath || currentPaths.has(entry.relativePath)) {
+			continue;
+		}
+
+		const oldUri = vscode.Uri.joinPath(config.contextRoot, ...entry.relativePath.split('/'));
+		if (!containsUri(generatedRoot, oldUri)) {
+			continue;
+		}
+		oldPaths.add(entry.relativePath);
+	}
+
+	for (const relativePath of oldPaths) {
+		const oldUri = vscode.Uri.joinPath(config.contextRoot, ...relativePath.split('/'));
+		try {
+			await vscode.workspace.fs.delete(oldUri);
+			logOutput(`[Reload] Umbenannte Datei entfernt: ${relativePath}`);
+		} catch (error) {
+			if (error instanceof vscode.FileSystemError && error.code === 'FileNotFound') {
+				continue;
+			}
+			throw error;
+		}
+	}
 }
 
 async function materializeQuickviewRow(
@@ -2183,8 +2262,11 @@ function describeAuthIdentity(username: string, domain: string): string {
 	return `${usernameHint}, ${domainHint}`;
 }
 
-function buildQuickviewSql(dashboardId: string, includeAnpVersion: boolean): string {
+function buildQuickviewSql(dashboardId: string, includeAnpVersion: boolean, dashboardGuid?: string): string {
 	const sanitizedId = escapeSqlString(dashboardId);
+	const dashboardFilter = dashboardGuid
+		? `QVDASHBOARD.GUID = '${escapeSqlString(dashboardGuid)}'`
+		: `QVDASHBOARD.QVDASHBOARD = '${sanitizedId}'`;
 	const anpQueryField = includeAnpVersion
 		? "COALESCE(CAST(qvdashboard.anp_version as varchar(50)), '') as ANP_VERSION"
 		: "'' as ANP_VERSION";
@@ -2199,13 +2281,13 @@ function buildQuickviewSql(dashboardId: string, includeAnpVersion: boolean): str
 	return `select qvquery.qvquery,qvquery.title,qvquery.GUID,qvquery.STATEMENT, QVQUERY.JSPAGESCRIPT,QVQUERY.CSSSTYLE, QVQUERY.OPTIONS, QVQUERY.VERSION, ${anpQueryField}${dashboardQueryFields}, type='QUERY' from QVQUERY
 join QVDASHBOARDQUERY on QVQUERY.QVQUERY = QVDASHBOARDQUERY.QVQUERY
 join QVDASHBOARD on QVDASHBOARDQUERY.QVDASHBOARD = QVDASHBOARD.QVDASHBOARD
-where QVDASHBOARD.QVDASHBOARD = '${sanitizedId}'
+where ${dashboardFilter}
 
 UNION ALL
 
 select QVDASHBOARD.QVDASHBOARD,QVDASHBOARD.title,QVDASHBOARD.GUID,'' as STATEMENT, QVDASHBOARD.JSPAGESCRIPT,QVDASHBOARD.CSSSTYLE, '' as OPTIONS, VERSION=${dashboardVersionField}, ${anpDashboardField}${emptyDashboardQueryFields}, type='DASHBOARD'
 from QVDASHBOARD
-where QVDASHBOARD.QVDASHBOARD = '${sanitizedId}'`;
+where ${dashboardFilter}`;
 }
 
 function buildFlowSql(flowGuid: string): string {
