@@ -95,6 +95,73 @@ Listen, optionale Schlüsselwörter und SQL-Fragmente in Parametern sind kein
 sicherer Vertrag für beliebige Eingaben. Werte typisieren und begrenzen.
 Parameter und UI-Sichtbarkeit ersetzen keine serverseitigen Berechtigungen.
 
+### `param` und `localparam` als URL-String
+
+Stand: 24.11.2026. Grundlage: vorhandene Frameworkdokumentation und statische
+Projektbefunde, keine neue APplus-Livepruefung. Gilt fuer eigenstaendige und
+eingebettete Quickviews; die konkrete Weitergabe im Zielbuild pruefen.
+
+| Quelle | Bedeutung und Weitergabe |
+|---|---|
+| `param` | Globaler Parameterstring des Dashboardaufrufs; wird im untersuchten Framework an die Query-Requests weitergegeben, oft aus `#global-data[data-param]`. Gilt nicht automatisch fuer die umgebende Fachseite. |
+| `localparam` | Lokaler Parameterstring eines einzelnen Query-Requests. Im Dashboard stammt er typischerweise aus `QVDASHBOARDQUERY.PARAMSTRING` ueber `data-localparam` des Elements. |
+| `QVQUERY.OPTIONS` | Querybezogene Parameterdefaults; kein URL-Parameterstring. Im untersuchten Pfad Ersatz fuer nicht uebergebene Parameter. |
+
+Beide Requestparameter enthalten selbst einen Querystring, also
+`Name=Wert&Name=Wert`. Die inneren Parameternamen muessen zu `$P{Name}` im
+SQL passen. `?id=42` ist nicht dasselbe wie `?param=id%3D42`: Im zweiten Fall
+liegt `id` innerhalb des vom QV-Parameterpfad gelesenen Strings.
+
+Schematische Beispiele mit neutralen Werten:
+
+```text
+Dashboard.aspx?name=BEISPIEL&param=id%3D42%26Status%3D2
+Query.aspx?name=BEISPIEL_QUERY&xhr=html&param=id%3D42%26Status%3D2&localparam=Status%3D3%26Gruppe%3DA
+```
+
+Nach dem Lesen der aeusseren Requestparameter enthalten diese:
+
+```text
+param:      id=42&Status=2
+localparam: Status=3&Gruppe=A
+```
+
+Im dokumentierten Serverpfad wird zuerst lokal, danach global eingelesen:
+Bei gleichem Namen gewinnt `param`, hier also `Status=2`; `Gruppe=A` bleibt
+lokal erhalten. Nicht aus dem Wort "lokal" einen Vorrang ableiten. Ob ein
+leerer Wert einen Default unterdrueckt, in der Zielversion pruefen; fehlend
+und leer nicht gleichsetzen. Ein `localparam` an der Dashboard-URL allein
+belegt nicht, dass er an alle Elemente weitergegeben wird.
+
+**Zwei Kodierungsebenen:** Zuerst einzelne innere Namen/Werte serialisieren,
+dann den gesamten inneren String als Wert von `param` bzw. `localparam` in
+die aeussere URL einsetzen. Beispiel ohne ERP-Aufruf:
+
+```javascript
+const inner = new URLSearchParams({ Gruppe: "A&B", Status: "2" }).toString();
+// inner: Gruppe=A%26B&Status=2
+const outer = new URLSearchParams({ name: "BEISPIEL", param: inner });
+// outer.toString(): name=BEISPIEL&param=Gruppe%3DA%2526B%26Status%3D2
+const received = new URLSearchParams(outer.toString()).get("param");
+const group = new URLSearchParams(received).get("Gruppe"); // A&B
+```
+
+`%2526` ist hier korrekt: Der innere Wert enthaelt ein kodiertes `&`.
+Ein rohes inneres `&` in der aeusseren URL wuerde dagegen einen neuen
+Requestparameter beginnen. Ein literales `+` als `%2B` serialisieren;
+Querystringparser koennen `+` als Leerzeichen lesen. Nicht vor dem Trennen
+der inneren Paare pauschal alles dekodieren, sonst wird ein Werte-`&` zum
+Trenner. DOM-Datasets koennen je Frameworkstand zusaetzlich kodiert sein;
+vorhandenen Parser nutzen, nicht blind mehrfach kodieren/dekodieren.
+
+In der gespeicherten `PARAMSTRING`-Datei steht nur der innere String, hier
+`Gruppe=A%26B&Status=2`, ohne `param=` oder `localparam=`. Eine Laufzeitaenderung
+von `dataset.localparam` speichert dieses ERP-Feld nicht; fuer sichtbare neue
+Querydaten ist der passende Query-Reload des vorhandenen Frameworks noetig.
+URL-Kodierung ersetzt weder SQL-Quoting noch SQL-Escaping: Ob etwa `A` oder
+`'A'` erwartet wird, entscheidet die SQL-Platzhalterstelle. Die Beispiele
+zeigen Transport, keine Freigabe fuer beliebige SQL-Eingaben oder Rechte.
+
 ## Query-Chart und Element-Chart unterscheiden
 
 - `QVQUERY.OPTIONS` ist querybezogenes XML. Untersuchte Exporte verwenden unter
